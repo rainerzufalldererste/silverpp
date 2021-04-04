@@ -5,6 +5,7 @@
 #include <dia2.h>
 #include <diacreate.h>
 #include <cvconst.h>
+#include <initguid.h>
 
 #include <vector>
 #include <deque>
@@ -39,7 +40,7 @@ extern "C"
 struct SPerfEval
 {
   wchar_t symbolName[384] = {};
-  size_t symbolStartPos;
+  size_t symbolStartPos, symbolEndPos;
   DWORD sector, offset;
 
   std::vector<uint32_t> hitsOffset;
@@ -52,7 +53,8 @@ struct SPerfEval
 
 struct SModuleInfo
 {
-  size_t baseAddress;
+  size_t moduleBaseAddress;
+  size_t startAddress;
   size_t endAddress;
   wchar_t sourceFile[MAX_PATH] = {};
   uint8_t *pBinary = nullptr;
@@ -79,6 +81,12 @@ struct SThreadRip
   size_t lastRip;
 };
 
+struct SProfileOptions
+{
+  bool getStackTraceOnExtern = false;
+  bool alwaysGetStackTrace = false;
+};
+
 struct SProfileResult
 {
   std::deque<size_t> directHits;
@@ -93,6 +101,7 @@ struct SAppInfo
 {
   std::vector<SThreadRip> threads;
   SModuleInfo modules;
+  HANDLE processHandle;
 };
 
 struct SLineEval
@@ -126,7 +135,7 @@ struct SLineEval
 
 struct SSourceFile
 {
-  wchar_t filename[256];
+  wchar_t filename[MAX_PATH];
   DWORD sourceFileId;
 };
 
@@ -195,7 +204,7 @@ inline size_t GetConsoleWidth()
   return bufferInfo.srWindow.Right - bufferInfo.srWindow.Left + 1;
 }
 
-SProfileResult ProfileApplication(SAppInfo &appInfo);
+SProfileResult ProfileApplicationNoStackTrace(SAppInfo &appInfo, const SProfileOptions &options);
 void UpdateAppInfo(SAppInfo &appInfo, const DEBUG_EVENT &evnt);
 SEvalResult EvaluateSession(_In_ CComPtr<IDiaSession> &session, _Inout_ SProfileResult &perfSession);
 bool GetDetailedEvaluation(_In_ CComPtr<IDiaSession> &session, _In_ const SPerfEval &function, _Inout_ SFuncEval &funcEval);
@@ -214,17 +223,59 @@ inline void CopyString(wchar_t *dst, const size_t dstSize, const wchar_t *src)
 
 ////////////////////////////////////////////////////////////////////////////////
 
+#define CMD_PARAM_ARGS_PASS_THROUGH "--args"
+wchar_t _CMD_PARAM_ARGS[] = TEXT(CMD_PARAM_ARGS_PASS_THROUGH);
+wchar_t _CMD_PARAM_ARGS_SPACE[] = TEXT(CMD_PARAM_ARGS_PASS_THROUGH) L" ";
+
+#define CMD_PARAM_INDIRECT_HITS "--add-indirect"
+wchar_t _CMD_PARAM_INDIRECT_HITS[] = TEXT(CMD_PARAM_INDIRECT_HITS);
+
+////////////////////////////////////////////////////////////////////////////////
+
 int32_t main(void)
 {
+  wchar_t *commandLine = GetCommandLineW();
+
   int32_t argc = 0;
-  wchar_t **pArgv = CommandLineToArgvW(GetCommandLineW(), &argc);
-  FATAL_IF(argc == 1, "Usage: silverpp <ExecutablePath> <Args>");
+  wchar_t **pArgv = CommandLineToArgvW(commandLine, &argc);
+  FATAL_IF(argc == 1, "\nUsage: silverpp <ExecutablePath>\n\n Optional Parameters:\n\n\t[ " CMD_PARAM_INDIRECT_HITS " ]\t | Trace external Samples back to the calling Function\n\t[ " CMD_PARAM_ARGS_PASS_THROUGH " <Args> ]\t | Pass the remaining Arguments to the Application being profiled\n");
 
   wchar_t workingDirectory[MAX_PATH];
   FATAL_IF(0 == GetCurrentDirectory(ARRAYSIZE(workingDirectory), workingDirectory), "Failed to retrieve working directory. Aborting.");
 
   wchar_t *appPath = pArgv[1];
   wchar_t *pdbPath = nullptr;
+  wchar_t *args = L"";
+
+  bool analyzeStack = false;
+  bool indirectHits = false;
+
+  int32_t argsRemaining = argc - 2;
+  int32_t argIndex = 2;
+
+  while (argsRemaining > 0)
+  {
+    if (wcscmp(pArgv[argIndex], _CMD_PARAM_INDIRECT_HITS) == 0)
+    {
+      indirectHits = true;
+
+      argsRemaining--;
+      argIndex++;
+    }
+    else if (wcscmp(pArgv[argIndex], _CMD_PARAM_ARGS) == 0 && argsRemaining > 1)
+    {
+      args = commandLine;
+
+      while (args[sizeof(_CMD_PARAM_ARGS_SPACE)] == '\0' || memcmp(args, _CMD_PARAM_ARGS_SPACE, sizeof(_CMD_PARAM_ARGS_SPACE) - sizeof(wchar_t)) != 0)
+        args++;
+
+      break;
+    }
+    else
+    {
+      FATAL("Invalid Parameter '%ws'. Aborting.", pArgv[argIndex]);
+    }
+  }
 
   CComPtr<IDiaSession> pdbSession;
 
@@ -254,46 +305,73 @@ int32_t main(void)
 
     printf("Attempting to launch '%ws'...\n", appPath);
 
-    FATAL_IF(!CreateProcessW(appPath, L"", NULL, NULL, FALSE, DEBUG_PROCESS | CREATE_NEW_CONSOLE, NULL, workingDirectory, &startupInfo, &processInfo), "Unable to start process. Aborting.");
+    FATAL_IF(!CreateProcessW(appPath, args, NULL, NULL, FALSE, DEBUG_PROCESS | CREATE_NEW_CONSOLE, NULL, workingDirectory, &startupInfo, &processInfo), "Unable to start process. Aborting.");
   }
 
   SAppInfo appInfo;
+  appInfo.processHandle = processInfo.hProcess;
   CopyString(appInfo.modules.sourceFile, sizeof(appInfo.modules.sourceFile), appPath);
-  
-  // Start Debugging. (Apparently required for `EnumProcessModules` to work)
+
+  // Start Debugging.
   {
     DEBUG_EVENT debugEvent;
 
     FATAL_IF(!WaitForDebugEvent(&debugEvent, 1000), "Failed to debug process. Aborting.");
-
-    do
-    {
-      UpdateAppInfo(appInfo, debugEvent);
-      FATAL_IF(!ContinueDebugEvent(debugEvent.dwProcessId, debugEvent.dwThreadId, DBG_CONTINUE), "Failed to continue debugged process. Aborting.");
-    } while (WaitForDebugEvent(&debugEvent, 1));
+    UpdateAppInfo(appInfo, debugEvent);
+    FATAL_IF(!ContinueDebugEvent(debugEvent.dwProcessId, debugEvent.dwThreadId, DBG_CONTINUE), "Failed to continue debugged process. Aborting.");
   }
 
   // Get Base Address of Main Module.
   {
     DWORD bytesRequired = 0;
     HMODULE modules[1024];
-    FATAL_IF(!EnumProcessModules(processInfo.hProcess, modules, sizeof(modules), &bytesRequired), "Failed to retrieve Process Modules. Aborting.");
+    DEBUG_EVENT debugEvent;
+    
+    while (0 == EnumProcessModules(appInfo.processHandle, modules, sizeof(modules), &bytesRequired) || bytesRequired < 8 * 3) // <module>, ntdll.dll, kernel32.dll
+    {
+      while (WaitForDebugEvent(&debugEvent, 0))
+      {
+        UpdateAppInfo(appInfo, debugEvent);
+        FATAL_IF(!ContinueDebugEvent(debugEvent.dwProcessId, debugEvent.dwThreadId, DBG_CONTINUE), "Failed to continue debugged process. Aborting.");
+      }
+    }
+
+    FATAL_IF(!DebugBreakProcess(appInfo.processHandle), "Failed to pause process.");
+    FATAL_IF(!WaitForDebugEvent(&debugEvent, 1000), "Failed to pause process. Aborting.");
+    UpdateAppInfo(appInfo, debugEvent);
 
     const uint8_t *pBaseAddress = reinterpret_cast<const uint8_t *>(modules[0]);
     IMAGE_DOS_HEADER moduleHeader;
     size_t bytesRead = 0;
-    FATAL_IF(!ReadProcessMemory(processInfo.hProcess, pBaseAddress, &moduleHeader, sizeof(moduleHeader), &bytesRead) || bytesRead != sizeof(moduleHeader), "Failed to Read Module DOS Header. Aborting.");
+    FATAL_IF(!ReadProcessMemory(appInfo.processHandle, pBaseAddress, &moduleHeader, sizeof(moduleHeader), &bytesRead) || bytesRead != sizeof(moduleHeader), "Failed to Read Module DOS Header. Aborting.");
 
     IMAGE_NT_HEADERS ntHeader;
-    FATAL_IF(!ReadProcessMemory(processInfo.hProcess, pBaseAddress + moduleHeader.e_lfanew, &ntHeader, sizeof(ntHeader), &bytesRead) || bytesRead != sizeof(ntHeader), "Failed to Read Module NT Header. Aborting.");
+    FATAL_IF(!ReadProcessMemory(appInfo.processHandle, pBaseAddress + moduleHeader.e_lfanew, &ntHeader, sizeof(ntHeader), &bytesRead) || bytesRead != sizeof(ntHeader), "Failed to Read Module NT Header. Aborting.");
 
-    appInfo.modules.baseAddress = (size_t)pBaseAddress;
-    appInfo.modules.endAddress = appInfo.modules.baseAddress + (size_t)ntHeader.OptionalHeader.SizeOfCode;
+    appInfo.modules.moduleBaseAddress = (size_t)pBaseAddress;
+    appInfo.modules.startAddress = ntHeader.OptionalHeader.BaseOfCode;
+    appInfo.modules.endAddress = appInfo.modules.startAddress + (size_t)ntHeader.OptionalHeader.SizeOfCode;
+    
+    // Place Main Thread in Threads.
+    {
+      SThreadRip mainThread;
+      mainThread.handle = processInfo.hThread;
+      mainThread.threadId = processInfo.dwThreadId;
+      mainThread.lastRip = 0;
+
+      appInfo.threads.emplace_back(mainThread);
+    }
+
+    FATAL_IF(!ContinueDebugEvent(debugEvent.dwProcessId, debugEvent.dwThreadId, DBG_CONTINUE), "Failed to continue debugged process. Aborting.");
   }
 
   puts("Starting Profiling Loop...");
 
-  SProfileResult profileSession = ProfileApplication(appInfo);
+  SProfileOptions profileOptions;
+  profileOptions.alwaysGetStackTrace = analyzeStack;
+  profileOptions.getStackTraceOnExtern = indirectHits;
+
+  SProfileResult profileSession = ProfileApplicationNoStackTrace(appInfo, profileOptions);
 
   printf("Profiler Stopped.\nCaptured %" PRIu64 " direct hits.\n", profileSession.directHits.size());
   
@@ -345,9 +423,11 @@ int32_t main(void)
 
 ////////////////////////////////////////////////////////////////////////////////
 
-SProfileResult ProfileApplication(SAppInfo &appInfo)
+SProfileResult ProfileApplicationNoStackTrace(SAppInfo &appInfo, const SProfileOptions &options)
 {
   SProfileResult ret;
+
+  FATAL_IF(options.alwaysGetStackTrace, "`alwaysGetStackTrace` is incompatible with this function. Aborting.");
 
   DEBUG_EVENT debugEvent;
 
@@ -386,10 +466,35 @@ SProfileResult ProfileApplication(SAppInfo &appInfo)
       {
         if (threadContext.Rip != _thread.lastRip)
         {
-          const size_t relativeAddress = threadContext.Rip - appInfo.modules.baseAddress;
+          const size_t relativeAddress = threadContext.Rip - appInfo.modules.moduleBaseAddress;
 
-          if (relativeAddress < appInfo.modules.endAddress)
+          if (relativeAddress < appInfo.modules.endAddress && relativeAddress >= appInfo.modules.startAddress)
+          {
             ret.directHits.emplace_back(relativeAddress);
+          }
+          else if (options.getStackTraceOnExtern)
+          {
+            STACKFRAME64 stackFrame;
+            ZeroMemory(&stackFrame, sizeof(stackFrame));
+
+            stackFrame.AddrPC.Offset = threadContext.Rip;
+            stackFrame.AddrPC.Mode = AddrModeFlat;
+            stackFrame.AddrFrame.Offset = threadContext.Rsp;
+            stackFrame.AddrFrame.Mode = AddrModeFlat;
+            stackFrame.AddrStack.Offset = threadContext.Rsp;
+            stackFrame.AddrStack.Mode = AddrModeFlat;
+
+            while (StackWalk64(IMAGE_FILE_MACHINE_AMD64, appInfo.processHandle, _thread.handle, &stackFrame, &threadContext, NULL, SymFunctionTableAccess64, SymGetModuleBase64, NULL))
+            {
+              const size_t stackRelativeAddress = stackFrame.AddrPC.Offset - appInfo.modules.moduleBaseAddress;
+
+              if (stackFrame.AddrPC.Segment == 0 && stackRelativeAddress < appInfo.modules.endAddress && stackRelativeAddress >= appInfo.modules.startAddress)
+              {
+                ret.directHits.emplace_back(stackRelativeAddress);
+                break;
+              }
+            }
+          }
 
           _thread.lastRip = threadContext.Rip;
         }
@@ -425,7 +530,7 @@ void UpdateAppInfo(SAppInfo &appInfo, const DEBUG_EVENT &evnt)
   {
   case CREATE_THREAD_DEBUG_EVENT:
   {
-    HANDLE thread = OpenThread(THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION | THREAD_SUSPEND_RESUME, FALSE, evnt.dwThreadId);
+    HANDLE thread = OpenThread(THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME, FALSE, evnt.dwThreadId);
 
     if (thread == INVALID_HANDLE_VALUE || thread == nullptr)
       printf("Failed to open Thread %" PRIu32 " with error %" PRIu32 ".\n", evnt.dwThreadId, GetLastError());
@@ -494,12 +599,12 @@ DWORD EvaluateSymbol(_In_ const CComPtr<IDiaSymbol> &symbol, _Inout_ std::vector
       if (FAILED(symbol->get_length(&length)))
         return virtualAddress;
 
-      const size_t endAddress = virtualAddress + length;
+      func.symbolEndPos = virtualAddress + length;
 
       while (positions.size() > 0 && positions[0] < virtualAddress) // Discard hits before this function. We're iterating linearly from front to back.
         positions.pop_front(); // Let's hope this doesn't happen too much...
 
-      while (positions.size() > 0 && positions[0] >= virtualAddress && positions[0] < endAddress)
+      while (positions.size() > 0 && positions[0] >= virtualAddress && positions[0] < func.symbolEndPos)
       {
         func.hitsOffset.emplace_back((uint32_t)(positions.front() - virtualAddress));
         positions.pop_front();
@@ -822,6 +927,31 @@ bool InstrumentFunctionWithSource(CComPtr<IDiaSession> &pdbSession, SAppInfo &ap
       if (pFile == nullptr)
       {
         printf("Failed to read file '%ws'.\n", lineEval.files[fileIndex].filename);
+
+        if (showDisasm)
+        {
+          size_t maxHit = 0;
+          size_t currentHits = 0;
+          uint32_t currentOffset = 0;
+
+          for (const auto &_hit : function.hitsOffset)
+          {
+            if (_hit != currentOffset)
+            {
+              maxHit = max(maxHit, currentHits);
+
+              currentHits = 0;
+              currentOffset = _hit;
+            }
+            
+            currentHits++;
+          }
+
+          maxHit = max(maxHit, currentHits);
+
+          InstrumentDisassembly(appInfo, function, function.symbolStartPos, function.symbolEndPos, options, maxHit);
+          SetConsoleColor(CC_BrightGray, CC_Black);
+        }
 
         while (lineEval.lines.size() > 1 && lineEval.lines[i + 1].fileIndex == fileIndex)
           i++;
