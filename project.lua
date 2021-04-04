@@ -28,8 +28,10 @@ project(ProjectName)
   files { "project.lua" }
   
   includedirs { "$(VCInstallDir)../DIA SDK/include" }
+  includedirs { "3rdParty/Zydis/include" }
 
   links { "$(VCInstallDir)../DIA SDK/lib/amd64/diaguids.lib" }
+  links { "3rdParty/zydis/lib/Zydis.lib" }
 
   filter { "configurations:Debug", "system:Windows" }
     ignoredefaultlibraries { "libcmt" }
