@@ -84,7 +84,9 @@ struct SThreadRip
 struct SProfileOptions
 {
   bool getStackTraceOnExtern = false;
+  bool fastStackTrace = false;
   bool alwaysGetStackTrace = false;
+  bool favorPerformance = true;
 };
 
 struct SProfileResult
@@ -230,6 +232,15 @@ wchar_t _CMD_PARAM_ARGS_SPACE[] = TEXT(CMD_PARAM_ARGS_PASS_THROUGH) L" ";
 #define CMD_PARAM_INDIRECT_HITS "--add-indirect"
 wchar_t _CMD_PARAM_INDIRECT_HITS[] = TEXT(CMD_PARAM_INDIRECT_HITS);
 
+#define CMD_PARAM_STACK_TRACE "--stack"
+wchar_t _CMD_PARAM_STACK_TRACE[] = TEXT(CMD_PARAM_STACK_TRACE);
+
+#define CMD_PARAM_FAST_STACK_TRACE "--fast-trace"
+wchar_t _CMD_PARAM_FAST_STACK_TRACE[] = TEXT(CMD_PARAM_FAST_STACK_TRACE);
+
+#define CMD_PARAM_FAVOR_ACCURACY "--favor-accuracy"
+wchar_t _CMD_PARAM_FAVOR_ACCURACY[] = TEXT(CMD_PARAM_FAVOR_ACCURACY);
+
 ////////////////////////////////////////////////////////////////////////////////
 
 int32_t main(void)
@@ -238,7 +249,7 @@ int32_t main(void)
 
   int32_t argc = 0;
   wchar_t **pArgv = CommandLineToArgvW(commandLine, &argc);
-  FATAL_IF(argc == 1, "\nUsage: silverpp <ExecutablePath>\n\n Optional Parameters:\n\n\t[ " CMD_PARAM_INDIRECT_HITS " ]\t | Trace external Samples back to the calling Function\n\t[ " CMD_PARAM_ARGS_PASS_THROUGH " <Args> ]\t | Pass the remaining Arguments to the Application being profiled\n");
+  FATAL_IF(argc == 1, "\nUsage: silverpp <ExecutablePath>\n\n Optional Parameters:\n\n\t[ " CMD_PARAM_INDIRECT_HITS " ]\t | Trace external Samples back to the calling Function\n\t[ " CMD_PARAM_STACK_TRACE " ]\t\t | Capture Stack Traces for all Samples\n\t[ " CMD_PARAM_FAST_STACK_TRACE " ]\t | Fast (but possibly less accurate) Stack Traces\n\t[ " CMD_PARAM_FAVOR_ACCURACY " ]\t | Favor Sampling Accuracy over Application Performance\n\t[ " CMD_PARAM_ARGS_PASS_THROUGH " <Args> ]\t | Pass the remaining Arguments to the Application being profiled\n");
 
   wchar_t workingDirectory[MAX_PATH];
   FATAL_IF(0 == GetCurrentDirectory(ARRAYSIZE(workingDirectory), workingDirectory), "Failed to retrieve working directory. Aborting.");
@@ -248,7 +259,9 @@ int32_t main(void)
   wchar_t *args = L"";
 
   bool analyzeStack = false;
+  bool analyzeStackFast = false;
   bool indirectHits = false;
+  bool favorAccuracy = false;
 
   int32_t argsRemaining = argc - 2;
   int32_t argIndex = 2;
@@ -258,6 +271,27 @@ int32_t main(void)
     if (wcscmp(pArgv[argIndex], _CMD_PARAM_INDIRECT_HITS) == 0)
     {
       indirectHits = true;
+
+      argsRemaining--;
+      argIndex++;
+    }
+    else if (wcscmp(pArgv[argIndex], _CMD_PARAM_FAVOR_ACCURACY) == 0)
+    {
+      favorAccuracy = true;
+
+      argsRemaining--;
+      argIndex++;
+    }
+    else if (wcscmp(pArgv[argIndex], _CMD_PARAM_STACK_TRACE) == 0)
+    {
+      analyzeStack = true;
+
+      argsRemaining--;
+      argIndex++;
+    }
+    else if (wcscmp(pArgv[argIndex], _CMD_PARAM_FAST_STACK_TRACE) == 0)
+    {
+      analyzeStackFast = true;
 
       argsRemaining--;
       argIndex++;
@@ -276,6 +310,10 @@ int32_t main(void)
       FATAL("Invalid Parameter '%ws'. Aborting.", pArgv[argIndex]);
     }
   }
+
+  FATAL_IF(analyzeStack, "Option '" CMD_PARAM_STACK_TRACE "' is not yet supported.");
+  FATAL_IF(analyzeStack && indirectHits, "Option '" CMD_PARAM_INDIRECT_HITS "' cannot be used in conjunction with option '" CMD_PARAM_STACK_TRACE "'.");
+  FATAL_IF(analyzeStackFast && !(analyzeStack || indirectHits), "Option '" CMD_PARAM_FAST_STACK_TRACE "' can only be used with '" CMD_PARAM_INDIRECT_HITS "' or '" CMD_PARAM_STACK_TRACE "'.");
 
   CComPtr<IDiaSession> pdbSession;
 
@@ -370,6 +408,8 @@ int32_t main(void)
   SProfileOptions profileOptions;
   profileOptions.alwaysGetStackTrace = analyzeStack;
   profileOptions.getStackTraceOnExtern = indirectHits;
+  profileOptions.fastStackTrace = analyzeStackFast;
+  profileOptions.favorPerformance = !favorAccuracy;
 
   SProfileResult profileSession = ProfileApplicationNoStackTrace(appInfo, profileOptions);
 
@@ -456,12 +496,16 @@ SProfileResult ProfileApplicationNoStackTrace(SAppInfo &appInfo, const SProfileO
       }
     }
 
-    for (auto &_thread : appInfo.threads)
-      if (!hasDebugEvent || debugEvent.dwThreadId != _thread.threadId)
-        SuspendThread(_thread.handle);
+    if (!options.favorPerformance)
+      for (auto &_thread : appInfo.threads)
+        if (!hasDebugEvent || debugEvent.dwThreadId != _thread.threadId)
+          SuspendThread(_thread.handle);
 
     for (auto &_thread : appInfo.threads)
     {
+      if (options.favorPerformance && (!hasDebugEvent || debugEvent.dwThreadId != _thread.threadId))
+        SuspendThread(_thread.handle);
+
       if (GetThreadContext(_thread.handle, &threadContext))
       {
         if (threadContext.Rip != _thread.lastRip)
@@ -474,24 +518,65 @@ SProfileResult ProfileApplicationNoStackTrace(SAppInfo &appInfo, const SProfileO
           }
           else if (options.getStackTraceOnExtern)
           {
-            STACKFRAME64 stackFrame;
-            ZeroMemory(&stackFrame, sizeof(stackFrame));
-
-            stackFrame.AddrPC.Offset = threadContext.Rip;
-            stackFrame.AddrPC.Mode = AddrModeFlat;
-            stackFrame.AddrFrame.Offset = threadContext.Rsp;
-            stackFrame.AddrFrame.Mode = AddrModeFlat;
-            stackFrame.AddrStack.Offset = threadContext.Rsp;
-            stackFrame.AddrStack.Mode = AddrModeFlat;
-
-            while (StackWalk64(IMAGE_FILE_MACHINE_AMD64, appInfo.processHandle, _thread.handle, &stackFrame, &threadContext, NULL, SymFunctionTableAccess64, SymGetModuleBase64, NULL))
+            if (options.fastStackTrace)
             {
-              const size_t stackRelativeAddress = stackFrame.AddrPC.Offset - appInfo.modules.moduleBaseAddress;
+              constexpr size_t stackDataCount = 64;
+              size_t stackData[stackDataCount];
 
-              if (stackFrame.AddrPC.Segment == 0 && stackRelativeAddress < appInfo.modules.endAddress && stackRelativeAddress >= appInfo.modules.startAddress)
+              size_t stackPosition = (threadContext.Rsp & ~(size_t)0x4) - sizeof(stackData) + sizeof(size_t);
+              const size_t moduleEndAddress = appInfo.modules.moduleBaseAddress + appInfo.modules.endAddress;
+
+              bool found = false;
+
+              while ((stackPosition & 0xFFFFF) > sizeof(stackData) * 2)
               {
-                ret.directHits.emplace_back(stackRelativeAddress);
-                break;
+                size_t bytesRead = 0;
+
+                if (!ReadProcessMemory(appInfo.processHandle, (void *)stackPosition, stackData, sizeof(stackData), &bytesRead))
+                  break;
+
+                for (int64_t i = stackDataCount - 1; i >= 0; i--)
+                {
+                  if (stackData[i] >= moduleEndAddress)
+                    break;
+
+                  const size_t virtualAddress = stackData[i] - appInfo.modules.moduleBaseAddress;
+
+                  if (virtualAddress >= appInfo.modules.startAddress)
+                  {
+                    ret.directHits.emplace_back(virtualAddress);
+                    found = true;
+                    break;
+                  }
+                }
+
+                if (found)
+                  break;
+
+                stackPosition -= sizeof(stackData);
+              }
+            }
+            else
+            {
+              STACKFRAME64 stackFrame;
+              ZeroMemory(&stackFrame, sizeof(stackFrame));
+
+              stackFrame.AddrPC.Offset = threadContext.Rip;
+              stackFrame.AddrPC.Mode = AddrModeFlat;
+              stackFrame.AddrFrame.Offset = threadContext.Rsp;
+              stackFrame.AddrFrame.Mode = AddrModeFlat;
+              stackFrame.AddrStack.Offset = threadContext.Rsp;
+              stackFrame.AddrStack.Mode = AddrModeFlat;
+
+              while (StackWalk64(IMAGE_FILE_MACHINE_AMD64, appInfo.processHandle, _thread.handle, &stackFrame, &threadContext, NULL, SymFunctionTableAccess64, SymGetModuleBase64, NULL))
+              {
+                const size_t stackRelativeAddress = stackFrame.AddrPC.Offset - appInfo.modules.moduleBaseAddress;
+
+                if (stackFrame.AddrPC.Segment == 0 && stackRelativeAddress < appInfo.modules.endAddress && stackRelativeAddress >= appInfo.modules.startAddress)
+                {
+                  ret.directHits.emplace_back(stackRelativeAddress);
+                  break;
+                }
               }
             }
           }
@@ -499,11 +584,15 @@ SProfileResult ProfileApplicationNoStackTrace(SAppInfo &appInfo, const SProfileO
           _thread.lastRip = threadContext.Rip;
         }
       }
+
+      if (options.favorPerformance && (!hasDebugEvent || debugEvent.dwThreadId != _thread.threadId))
+        ResumeThread(_thread.handle);
     }
 
-    for (auto &_thread : appInfo.threads)
-      if (!hasDebugEvent || debugEvent.dwThreadId != _thread.threadId)
-        ResumeThread(_thread.handle);
+    if (!options.favorPerformance)
+      for (auto &_thread : appInfo.threads)
+        if (!hasDebugEvent || debugEvent.dwThreadId != _thread.threadId)
+          ResumeThread(_thread.handle);
 
     if (hasDebugEvent)
     {
@@ -590,14 +679,14 @@ DWORD EvaluateSymbol(_In_ const CComPtr<IDiaSymbol> &symbol, _Inout_ std::vector
     {
       SPerfEval func;
       func.symbolStartPos = virtualAddress;
-
-      CopyString(func.symbolName, sizeof(func.symbolName), symbolName);
-      SysFreeString(symbolName);
       
       size_t length;
 
       if (FAILED(symbol->get_length(&length)))
+      {
+        SysFreeString(symbolName);
         return virtualAddress;
+      }
 
       func.symbolEndPos = virtualAddress + length;
 
@@ -618,8 +707,12 @@ DWORD EvaluateSymbol(_In_ const CComPtr<IDiaSymbol> &symbol, _Inout_ std::vector
         if (FAILED(symbol->get_addressOffset(&func.offset)))
           func.offset = (DWORD)-1;
 
+        CopyString(func.symbolName, sizeof(func.symbolName), symbolName);
+
         evaluation.emplace_back(std::move(func));
       }
+
+      SysFreeString(symbolName);
     }
   }
 
@@ -825,6 +918,9 @@ bool LoadBinary(SAppInfo &appInfo)
 
 bool InstrumentDisassembly(SAppInfo &appInfo, const SPerfEval &function, const size_t startAddress, const size_t endAddress, const SFuncLineOptions &options, const size_t maxLineHits)
 {
+  if (startAddress == endAddress)
+    return true;
+
   size_t virtualAddress = startAddress;
   ZydisDecodedInstruction instruction;
   char disasmBuffer[1024] = {};
