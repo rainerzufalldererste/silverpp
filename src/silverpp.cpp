@@ -245,7 +245,7 @@ inline size_t GetConsoleWidth()
 
 SProfileResult ProfileApplicationNoStackTrace(SAppInfo &appInfo, const SProfileOptions &options);
 void UpdateAppInfo(SAppInfo &appInfo, const DEBUG_EVENT &evnt);
-SEvalResult EvaluateSession(SAppInfo &appInfo, _Inout_ SProfileResult &perfSession);
+SEvalResult EvaluateSession(SAppInfo &appInfo, _Inout_ SProfileResult &perfSession, const size_t startIndex, const size_t endIndex);
 bool GetDetailedEvaluation(_In_ CComPtr<IDiaSession> &session, _In_ const SPerfEval &function, _Inout_ SFuncEval &funcEval);
 bool InstrumentFunctionWithSource(SAppInfo &appInfo, const SEvalResult &evaluation, const size_t index, const SFuncLineOptions &options);
 bool LoadBinary(SAppInfo &appInfo, const size_t moduleIndex);
@@ -281,6 +281,13 @@ wchar_t _CMD_PARAM_FAVOR_ACCURACY[] = TEXT(CMD_PARAM_FAVOR_ACCURACY);
 #define CMD_PARAM_NO_DISASM "--no-disasm"
 wchar_t _CMD_PARAM_NO_DISASM[] = TEXT(CMD_PARAM_NO_DISASM);
 
+#define CMD_PARAM_VERBOSE "--verbose"
+wchar_t _CMD_PARAM_VERBOSE[] = TEXT(CMD_PARAM_VERBOSE);
+
+////////////////////////////////////////////////////////////////////////////////
+
+static bool _VerboseLogging = false;
+
 ////////////////////////////////////////////////////////////////////////////////
 
 int32_t main(void)
@@ -289,7 +296,7 @@ int32_t main(void)
 
   int32_t argc = 0;
   wchar_t **pArgv = CommandLineToArgvW(commandLine, &argc);
-  FATAL_IF(argc == 1, "\nUsage: silverpp <ExecutablePath>\n\n Optional Parameters:\n\n\t[ " CMD_PARAM_INDIRECT_HITS " ]\t | Trace external Samples back to the calling Function\n\t[ " CMD_PARAM_STACK_TRACE " ]\t\t | Capture Stack Traces for all Samples\n\t[ " CMD_PARAM_FAST_STACK_TRACE " ]\t | Fast (but possibly less accurate) Stack Traces\n\t[ " CMD_PARAM_FAVOR_ACCURACY " ]\t | Favor Sampling Accuracy over Application Performance\n\t[ " CMD_PARAM_NO_DISASM " ]\t\t | Don't display disassembly for expensive lines\n\t[ " CMD_PARAM_ARGS_PASS_THROUGH " <Args> ]\t | Pass the remaining Arguments to the Application being profiled\n");
+  FATAL_IF(argc == 1, "\nUsage: silverpp <ExecutablePath>\n\n Optional Parameters:\n\n\t[ " CMD_PARAM_INDIRECT_HITS " ]\t | Trace external Samples back to the calling Function\n\t[ " CMD_PARAM_STACK_TRACE " ]\t\t | Capture Stack Traces for all Samples\n\t[ " CMD_PARAM_FAST_STACK_TRACE " ]\t | Fast (but possibly less accurate) Stack Traces\n\t[ " CMD_PARAM_FAVOR_ACCURACY " ]\t | Favor Sampling Accuracy over Application Performance\n\t[ " CMD_PARAM_NO_DISASM " ]\t\t | Don't display disassembly for expensive lines\n\t[ " CMD_PARAM_VERBOSE " ]\t\t | Enable verbose logging\n\t[ " CMD_PARAM_ARGS_PASS_THROUGH " <Args> ]\t | Pass the remaining Arguments to the Application being profiled\n");
 
   wchar_t workingDirectory[MAX_PATH];
   FATAL_IF(0 == GetCurrentDirectory(ARRAYSIZE(workingDirectory), workingDirectory), "Failed to retrieve working directory. Aborting.");
@@ -340,6 +347,13 @@ int32_t main(void)
     else if (wcscmp(pArgv[argIndex], _CMD_PARAM_NO_DISASM) == 0)
     {
       noDisAsm = true;
+
+      argsRemaining--;
+      argIndex++;
+    }
+    else if (wcscmp(pArgv[argIndex], _CMD_PARAM_VERBOSE) == 0)
+    {
+      _VerboseLogging = true;
 
       argsRemaining--;
       argIndex++;
@@ -456,60 +470,170 @@ int32_t main(void)
     FATAL_IF(!ContinueDebugEvent(debugEvent.dwProcessId, debugEvent.dwThreadId, DBG_CONTINUE), "Failed to continue debugged process. Aborting.");
   }
 
-  puts("Starting Profiling Loop...");
-
-  SProfileOptions profileOptions;
-  profileOptions.alwaysGetStackTrace = analyzeStack;
-  profileOptions.getStackTraceOnExtern = indirectHits;
-  profileOptions.fastStackTrace = analyzeStackFast;
-  profileOptions.favorPerformance = !favorAccuracy;
-
-  SProfileResult profileSession = ProfileApplicationNoStackTrace(appInfo, profileOptions);
-
-  printf("Profiler Stopped.\nCaptured %" PRIu64 " direct hits.\n", profileSession.directHits.size());
-  
-  puts("Evaluating Profiling Data...");
-
-  SEvalResult evaluation = EvaluateSession(appInfo, profileSession);
-
-  puts("Sorting Evaluation...");
-
-  std::sort(evaluation.eval.begin(), evaluation.eval.end());
-
-  puts("\nResults:\n");
-
-  size_t count = 0;
-
-  for (const auto &_func : evaluation.eval)
+  if (!analyzeStack)
   {
-    ++count;
+    puts("Starting Profiling Loop...");
 
-    if (count > 50)
-      break;
+    SProfileOptions profileOptions;
+    profileOptions.alwaysGetStackTrace = analyzeStack;
+    profileOptions.getStackTraceOnExtern = indirectHits;
+    profileOptions.fastStackTrace = analyzeStackFast;
+    profileOptions.favorPerformance = !favorAccuracy;
 
-    printf("#%02" PRIu64 " | % 6" PRIu64 " %ws\n", count, _func.hitsOffset.size(), _func.symbolName);
-  }
+    SProfileResult profileSession = ProfileApplicationNoStackTrace(appInfo, profileOptions);
 
-  // Explore Stackless Performance Evaluation.
-  {
-    SFuncLineOptions options;
-    options.disasmExpensiveLines = !noDisAsm;
+    printf("Profiler Stopped.\nCaptured %" PRIu64 " direct hits.\n", profileSession.directHits.size());
 
-    // Select a function to profile and display hits in the source file.
-    while (true)
+    size_t startIndex = 0;
+    size_t endIndex = 0;
+
     {
-      puts("\n\nIndex (or 0 to exit)?");
+      constexpr size_t barWidth = 5;
+      constexpr size_t barHeight = 8;
 
-      size_t index;
+      const size_t width = min(GetConsoleWidth() / barWidth, profileSession.indexAtSecond.size());
+      const size_t widthSkips = profileSession.indexAtSecond.size() / width;
 
-      if (1 != scanf("%" PRIu64 "", &index))
-        continue;
+      size_t maxHeight = 0;
+      size_t lastIndex = 0;
 
-      if (index == 0)
+      struct Bar
+      {
+        size_t startIndex;
+        size_t endIndex;
+        size_t startSecond;
+      };
+
+      std::vector<Bar> bars;
+
+      for (size_t i = widthSkips; i < profileSession.indexAtSecond.size(); i += widthSkips)
+      {
+        const size_t maxIndex = min(profileSession.indexAtSecond.size() - 1, i + widthSkips - 1);
+        const size_t currentIndex = profileSession.indexAtSecond[maxIndex - 1];
+        const size_t currentCount = currentIndex - lastIndex;
+
+        bars.push_back({ lastIndex, currentIndex, i });
+
+        maxHeight = max(currentCount, maxHeight);
+        lastIndex = currentIndex;
+      }
+
+      constexpr size_t displayFactor = 4;
+      const size_t heightDiv = maxHeight / barHeight;
+
+      const ConsoleColor colors[] = { CC_DarkGreen, CC_BrightGreen, CC_BrightYellow, CC_BrightYellow, CC_DarkYellow, CC_DarkYellow, CC_BrightRed, CC_DarkRed };
+      _STATIC_ASSERT(ARRAYSIZE(colors) == barHeight);
+
+      for (int64_t i = barHeight; i >= 0; i--)
+      {
+        SetConsoleColor(colors[i], CC_Black);
+
+        for (const auto &_bar : bars)
+        {
+          const size_t div = ((_bar.endIndex - _bar.startIndex) * displayFactor) / heightDiv;
+          size_t rem = 0;
+
+          if (div > (size_t)i * displayFactor)
+            rem = div - (size_t)i * displayFactor;
+
+          switch (rem)
+          {
+          case 0: fputs("     ", stdout); break;
+          case 1: fputs("____ ", stdout); break;
+          case 2: fputs(".... ", stdout); break;
+          case 3: fputs("oooo ", stdout); break;
+          default:fputs("#### ", stdout); break;
+          }
+        }
+
+        puts("");
+      }
+
+      SetConsoleColor(CC_BrightGray, CC_Black);
+
+      for (const auto &_bar : bars)
+        fputs("-----", stdout);
+
+      puts("");
+
+      for (const auto &_bar : bars)
+        printf("% 4" PRIu64 "|", _bar.startSecond);
+
+      puts("\n");
+
+      puts("Select Start Second: (0 to include everything)");
+
+      size_t second = 0;
+
+      if (1 == scanf("%" PRIu64 "", &second))
+        second = 0;
+
+      if (second == 0)
+        startIndex = 0;
+      else
+        startIndex = profileSession.indexAtSecond[min(second, profileSession.indexAtSecond.size() - 1)];
+
+      puts("Select End Second: (0 to include everything)");
+
+      if (1 == scanf("%" PRIu64 "", &second))
+        second = 0;
+
+      if (second == 0)
+        endIndex = profileSession.directHits.size();
+      else
+        endIndex = profileSession.indexAtSecond[min(second, profileSession.indexAtSecond.size() - 1)];
+    }
+
+    if (startIndex >= endIndex)
+      endIndex = profileSession.directHits.size();
+
+    puts("Evaluating Profiling Data...");
+
+    SEvalResult evaluation = EvaluateSession(appInfo, profileSession, startIndex, endIndex);
+
+    puts("Sorting Evaluation...");
+
+    std::sort(evaluation.eval.begin(), evaluation.eval.end());
+
+    puts("\nResults:\n");
+
+    size_t count = 0;
+
+    for (const auto &_func : evaluation.eval)
+    {
+      ++count;
+
+      if (count > 50)
         break;
 
-      InstrumentFunctionWithSource(appInfo, evaluation, index - 1, options);
+      printf("#%02" PRIu64 " | % 6" PRIu64 " | %ws\n", count, _func.hitsOffset.size(), _func.symbolName);
     }
+
+    // Explore Stackless Performance Evaluation.
+    {
+      SFuncLineOptions options;
+      options.disasmExpensiveLines = !noDisAsm;
+
+      // Select a function to profile and display hits in the source file.
+      while (true)
+      {
+        puts("\n\nIndex (or 0 to exit)?");
+
+        size_t index;
+
+        if (1 != scanf("%" PRIu64 "", &index))
+          continue;
+
+        if (index == 0)
+          break;
+
+        InstrumentFunctionWithSource(appInfo, evaluation, index - 1, options);
+      }
+    }
+  }
+  else
+  {
+    FATAL("StackTrace Analysis is not implemented yet. Aborting.");
   }
 
   return 0;
@@ -528,6 +652,8 @@ SProfileResult ProfileApplicationNoStackTrace(SAppInfo &appInfo, const SProfileO
   CONTEXT threadContext;
   threadContext.ContextFlags = CONTEXT_CONTROL;
 
+  size_t lastTicks = GetTickCount64();
+  
   while (true)
   {
     const bool hasDebugEvent = WaitForDebugEvent(&debugEvent, 0);
@@ -548,6 +674,14 @@ SProfileResult ProfileApplicationNoStackTrace(SAppInfo &appInfo, const SProfileO
         break;
       }
       }
+    }
+
+    const size_t ticks = GetTickCount64();
+
+    if (ticks > lastTicks + 1000)
+    {
+      ret.indexAtSecond.push_back(ret.directHits.size());
+      lastTicks = ticks;
     }
 
     if (!options.favorPerformance)
@@ -684,6 +818,8 @@ SProfileResult ProfileApplicationNoStackTrace(SAppInfo &appInfo, const SProfileO
     }
   }
 
+  ret.indexAtSecond.push_back(ret.directHits.size());
+
   return ret;
 }
 
@@ -725,23 +861,105 @@ void UpdateAppInfo(SAppInfo &appInfo, const DEBUG_EVENT &evnt)
   {
     wchar_t filename[MAX_PATH];
 
+    SetConsoleColor(CC_DarkGray, CC_Black);
+
     if (GetModuleFileName((HMODULE)evnt.u.LoadDll.lpBaseOfDll, filename, ARRAYSIZE(filename)))
     {
-      SetConsoleColor(CC_DarkGray, CC_Black);
-      printf("Loaded DLL '%ws'.\n", filename);
-      SetConsoleColor(CC_BrightGray, CC_Black);
-    }
+      if (_VerboseLogging)
+        printf("Loaded DLL '%ws'.", filename);
 
-    if (evnt.u.LoadDll.nDebugInfoSize != 0 && evnt.u.LoadDll.dwDebugInfoFileOffset != 0)
+      if (evnt.u.LoadDll.nDebugInfoSize != 0 && evnt.u.LoadDll.dwDebugInfoFileOffset != 0)
+      {
+        SModuleInfo info;
+
+        CComPtr<IDiaDataSource> pdbSource;
+
+        if (FAILED(CoCreateInstance(CLSID_DiaSource, nullptr, CLSCTX_INPROC_SERVER, __uuidof(IDiaDataSource), (void **)&pdbSource)) || FAILED(pdbSource->loadDataForExe(filename, nullptr, nullptr)) || FAILED(pdbSource->openSession(&info.pdbSession)))
+        {
+          if (_VerboseLogging)
+            puts(" (Failed to load PDB)");
+        }
+        else
+        {
+          IMAGE_DOS_HEADER moduleHeader;
+          IMAGE_NT_HEADERS ntHeader;
+          size_t bytesRead = 0;
+
+          if (!ReadProcessMemory(appInfo.processHandle, evnt.u.LoadDll.lpBaseOfDll, &moduleHeader, sizeof(moduleHeader), &bytesRead) || bytesRead != sizeof(moduleHeader) || !ReadProcessMemory(appInfo.processHandle, reinterpret_cast<const uint8_t *>(evnt.u.LoadDll.lpBaseOfDll) + moduleHeader.e_lfanew, &ntHeader, sizeof(ntHeader), &bytesRead) || bytesRead != sizeof(ntHeader))
+          {
+            if (_VerboseLogging)
+              puts(" (Failed to load DOS / NT header)");
+          }
+          else
+          {
+            CopyString(info.filename, sizeof(info.filename), filename);
+            info.moduleName = PathFindFileNameW(info.filename);
+            info.moduleBaseAddress = (size_t)evnt.u.LoadDll.lpBaseOfDll;
+            info.startAddress = ntHeader.OptionalHeader.BaseOfCode;
+            info.endAddress = appInfo.modules[0].startAddress + (size_t)ntHeader.OptionalHeader.SizeOfCode;
+            info.moduleEndAddress = appInfo.modules[0].moduleBaseAddress + appInfo.modules[0].endAddress;
+
+            appInfo.modules.push_back(info);
+
+            if (!_VerboseLogging)
+              printf("Loaded DLL '%ws'.", filename);
+
+            puts(" (Module Added)");
+          }
+        }
+      }
+      else
+      {
+        if (_VerboseLogging)
+          puts(" (Skipped)");
+      }
+    }
+    else
     {
-
+      if (_VerboseLogging)
+        printf("Skipping Unknown Module at 0x%" PRIX64 ".\n", (size_t)evnt.u.LoadDll.lpBaseOfDll);
     }
+
+    SetConsoleColor(CC_BrightGray, CC_Black);
 
     break;
   }
 
   case UNLOAD_DLL_DEBUG_EVENT:
   {
+    wchar_t filename[MAX_PATH];
+
+    if (GetModuleFileName((HMODULE)evnt.u.LoadDll.lpBaseOfDll, filename, ARRAYSIZE(filename)))
+    {
+      if (_VerboseLogging)
+        printf("Unloaded DLL '%ws'.", filename);
+
+      bool found = false;
+
+      for (size_t i = 0; i < appInfo.modules.size(); i++)
+      {
+        if (appInfo.modules[i].moduleBaseAddress == (size_t)evnt.u.UnloadDll.lpBaseOfDll)
+        {
+          if (!_VerboseLogging)
+            printf("Unloaded DLL '%ws'.", filename);
+
+          puts(" (Module Archived)");
+
+          appInfo.inactiveModules.push_back(appInfo.modules[i]);
+          appInfo.modules.erase(appInfo.modules.begin() + i);
+          break;
+        }
+
+        if (!found)
+          puts(" (Skipped)");
+      }
+    }
+    else
+    {
+      if (_VerboseLogging)
+        printf("Unloaded Unknown Module at 0x%" PRIX64 ".\n", (size_t)evnt.u.LoadDll.lpBaseOfDll);
+    }
+
     break;
   }
   }
@@ -749,17 +967,14 @@ void UpdateAppInfo(SAppInfo &appInfo, const DEBUG_EVENT &evnt)
 
 ////////////////////////////////////////////////////////////////////////////////
 
-SEvalResult EvaluateSession(SAppInfo &appInfo, _Inout_ SProfileResult &perfSession)
+SEvalResult EvaluateSession(SAppInfo &appInfo, _Inout_ SProfileResult &perfSession, const size_t startIndex, const size_t endIndex)
 {
   SEvalResult ret;
 
-  std::sort(perfSession.directHits.begin(), perfSession.directHits.end());
+  std::sort(perfSession.directHits.begin() + startIndex, perfSession.directHits.begin() + endIndex);
 
   if (appInfo.inactiveModules.size() > 0)
     appInfo.modules.insert(appInfo.modules.begin(), std::make_move_iterator(begin(appInfo.inactiveModules)), std::make_move_iterator(end(appInfo.inactiveModules)));
-  
-  const size_t startIndex = 0;
-  const size_t endIndex = perfSession.directHits.size();
 
   size_t i = startIndex;
 
@@ -800,6 +1015,7 @@ SEvalResult EvaluateSession(SAppInfo &appInfo, _Inout_ SProfileResult &perfSessi
       SPerfEval func;
       func.symbolStartPos = virtualAddress;
       func.symbolEndPos = func.symbolStartPos + length;
+      func.moduleIndex = hit.GetModule();
 
       CopyString(func.symbolName, sizeof(func.symbolName), appInfo.modules[func.moduleIndex].moduleName);
       StrCatBuffW(func.symbolName, L" - ", sizeof(func.symbolName));
