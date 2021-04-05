@@ -42,6 +42,7 @@ struct SPerfEval
   wchar_t symbolName[384] = {};
   size_t symbolStartPos, symbolEndPos;
   DWORD sector, offset;
+  uint8_t moduleIndex;
 
   std::vector<uint32_t> hitsOffset;
 
@@ -54,13 +55,17 @@ struct SPerfEval
 struct SModuleInfo
 {
   size_t moduleBaseAddress;
+  size_t moduleEndAddress;
   size_t startAddress;
   size_t endAddress;
-  wchar_t sourceFile[MAX_PATH] = {};
+  wchar_t filename[MAX_PATH] = {};
+  wchar_t *moduleName = L"<UNKNOWN>";
   uint8_t *pBinary = nullptr;
   size_t binaryLength = 0;
 
   bool hasDisasm = false;
+
+  CComPtr<IDiaSession> pdbSession;
 
 #ifndef _NO_DISASM
   ZydisDecoder decoder;
@@ -89,9 +94,40 @@ struct SProfileOptions
   bool favorPerformance = true;
 };
 
+struct SProfileHit
+{
+  size_t packed;
+
+  inline const SProfileHit(const size_t address, const uint8_t moduleIndex)
+  {
+    packed = address | ((size_t)moduleIndex << 56);
+  }
+
+  inline size_t GetAddress() const
+  {
+    return packed & (size_t)0x00FFFFFFFFFFFFFF;
+  }
+
+  inline size_t GetModule() const
+  {
+    return (packed >> 56) & 0xFF;
+  }
+
+  inline operator size_t () const
+  {
+    return GetAddress();
+  }
+
+  inline bool operator < (const SProfileHit &other) const
+  {
+    return packed < other.packed;
+  }
+};
+
 struct SProfileResult
 {
-  std::deque<size_t> directHits;
+  std::deque<SProfileHit> directHits;
+  std::vector<size_t> indexAtSecond;
 };
 
 struct SEvalResult
@@ -102,7 +138,8 @@ struct SEvalResult
 struct SAppInfo
 {
   std::vector<SThreadRip> threads;
-  SModuleInfo modules;
+  std::vector<SModuleInfo> modules;
+  std::vector<SModuleInfo> inactiveModules;
   HANDLE processHandle;
 };
 
@@ -121,7 +158,7 @@ struct SLineEval
     hits(hits)
   { }
 
-  inline bool operator < (const SLineEval &other)
+  inline bool operator < (const SLineEval &other) const
   {
     if (fileIndex < other.fileIndex)
       return true;
@@ -208,10 +245,10 @@ inline size_t GetConsoleWidth()
 
 SProfileResult ProfileApplicationNoStackTrace(SAppInfo &appInfo, const SProfileOptions &options);
 void UpdateAppInfo(SAppInfo &appInfo, const DEBUG_EVENT &evnt);
-SEvalResult EvaluateSession(_In_ CComPtr<IDiaSession> &session, _Inout_ SProfileResult &perfSession);
+SEvalResult EvaluateSession(SAppInfo &appInfo, _Inout_ SProfileResult &perfSession);
 bool GetDetailedEvaluation(_In_ CComPtr<IDiaSession> &session, _In_ const SPerfEval &function, _Inout_ SFuncEval &funcEval);
-bool InstrumentFunctionWithSource(CComPtr<IDiaSession> &pdbSession, SAppInfo &appInfo, const SEvalResult &evaluation, const size_t index, const SFuncLineOptions &options);
-bool LoadBinary(SAppInfo &appInfo);
+bool InstrumentFunctionWithSource(SAppInfo &appInfo, const SEvalResult &evaluation, const size_t index, const SFuncLineOptions &options);
+bool LoadBinary(SAppInfo &appInfo, const size_t moduleIndex);
 bool InstrumentDisassembly(SAppInfo &appInfo, const SPerfEval &function, const size_t virtualStartAddress, const size_t virtualEndAddress, const SFuncLineOptions &options, const size_t maxLineHits);
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -241,6 +278,9 @@ wchar_t _CMD_PARAM_FAST_STACK_TRACE[] = TEXT(CMD_PARAM_FAST_STACK_TRACE);
 #define CMD_PARAM_FAVOR_ACCURACY "--favor-accuracy"
 wchar_t _CMD_PARAM_FAVOR_ACCURACY[] = TEXT(CMD_PARAM_FAVOR_ACCURACY);
 
+#define CMD_PARAM_NO_DISASM "--no-disasm"
+wchar_t _CMD_PARAM_NO_DISASM[] = TEXT(CMD_PARAM_NO_DISASM);
+
 ////////////////////////////////////////////////////////////////////////////////
 
 int32_t main(void)
@@ -249,7 +289,7 @@ int32_t main(void)
 
   int32_t argc = 0;
   wchar_t **pArgv = CommandLineToArgvW(commandLine, &argc);
-  FATAL_IF(argc == 1, "\nUsage: silverpp <ExecutablePath>\n\n Optional Parameters:\n\n\t[ " CMD_PARAM_INDIRECT_HITS " ]\t | Trace external Samples back to the calling Function\n\t[ " CMD_PARAM_STACK_TRACE " ]\t\t | Capture Stack Traces for all Samples\n\t[ " CMD_PARAM_FAST_STACK_TRACE " ]\t | Fast (but possibly less accurate) Stack Traces\n\t[ " CMD_PARAM_FAVOR_ACCURACY " ]\t | Favor Sampling Accuracy over Application Performance\n\t[ " CMD_PARAM_ARGS_PASS_THROUGH " <Args> ]\t | Pass the remaining Arguments to the Application being profiled\n");
+  FATAL_IF(argc == 1, "\nUsage: silverpp <ExecutablePath>\n\n Optional Parameters:\n\n\t[ " CMD_PARAM_INDIRECT_HITS " ]\t | Trace external Samples back to the calling Function\n\t[ " CMD_PARAM_STACK_TRACE " ]\t\t | Capture Stack Traces for all Samples\n\t[ " CMD_PARAM_FAST_STACK_TRACE " ]\t | Fast (but possibly less accurate) Stack Traces\n\t[ " CMD_PARAM_FAVOR_ACCURACY " ]\t | Favor Sampling Accuracy over Application Performance\n\t[ " CMD_PARAM_NO_DISASM " ]\t\t | Don't display disassembly for expensive lines\n\t[ " CMD_PARAM_ARGS_PASS_THROUGH " <Args> ]\t | Pass the remaining Arguments to the Application being profiled\n");
 
   wchar_t workingDirectory[MAX_PATH];
   FATAL_IF(0 == GetCurrentDirectory(ARRAYSIZE(workingDirectory), workingDirectory), "Failed to retrieve working directory. Aborting.");
@@ -262,6 +302,7 @@ int32_t main(void)
   bool analyzeStackFast = false;
   bool indirectHits = false;
   bool favorAccuracy = false;
+  bool noDisAsm = false;
 
   int32_t argsRemaining = argc - 2;
   int32_t argIndex = 2;
@@ -296,6 +337,13 @@ int32_t main(void)
       argsRemaining--;
       argIndex++;
     }
+    else if (wcscmp(pArgv[argIndex], _CMD_PARAM_NO_DISASM) == 0)
+    {
+      noDisAsm = true;
+
+      argsRemaining--;
+      argIndex++;
+    }
     else if (wcscmp(pArgv[argIndex], _CMD_PARAM_ARGS) == 0 && argsRemaining > 1)
     {
       args = commandLine + wcslen(pArgv[0]) + wcslen(pArgv[1]) + 2;
@@ -315,7 +363,10 @@ int32_t main(void)
   FATAL_IF(analyzeStack && indirectHits, "Option '" CMD_PARAM_INDIRECT_HITS "' cannot be used in conjunction with option '" CMD_PARAM_STACK_TRACE "'.");
   FATAL_IF(analyzeStackFast && !(analyzeStack || indirectHits), "Option '" CMD_PARAM_FAST_STACK_TRACE "' can only be used with '" CMD_PARAM_INDIRECT_HITS "' or '" CMD_PARAM_STACK_TRACE "'.");
 
-  CComPtr<IDiaSession> pdbSession;
+  SAppInfo appInfo;
+  appInfo.modules.emplace_back();
+  CopyString(appInfo.modules[0].filename, sizeof(appInfo.modules[0].filename), appPath);
+  appInfo.modules[0].moduleName = PathFindFileNameW(appInfo.modules[0].filename);
 
   // Attempt to read PDB.
   {
@@ -329,7 +380,7 @@ int32_t main(void)
       if (FAILED(pdbSource->loadDataForExe(appPath, nullptr, nullptr)))
         FATAL("Failed to find pdb for the specified path.");
 
-    FATAL_IF(FAILED(pdbSource->openSession(&pdbSession)), "Failed to Open Session.");
+    FATAL_IF(FAILED(pdbSource->openSession(&appInfo.modules[0].pdbSession)), "Failed to Open Session.");
   }
 
   PROCESS_INFORMATION processInfo;
@@ -349,9 +400,7 @@ int32_t main(void)
     FATAL_IF(!CreateProcessW(appPath, args, NULL, NULL, FALSE, DEBUG_PROCESS | CREATE_NEW_CONSOLE, NULL, workingDirectory, &startupInfo, &processInfo), "Unable to start process. Aborting.");
   }
 
-  SAppInfo appInfo;
   appInfo.processHandle = processInfo.hProcess;
-  CopyString(appInfo.modules.sourceFile, sizeof(appInfo.modules.sourceFile), appPath);
 
   // Start Debugging.
   {
@@ -389,9 +438,10 @@ int32_t main(void)
     IMAGE_NT_HEADERS ntHeader;
     FATAL_IF(!ReadProcessMemory(appInfo.processHandle, pBaseAddress + moduleHeader.e_lfanew, &ntHeader, sizeof(ntHeader), &bytesRead) || bytesRead != sizeof(ntHeader), "Failed to Read Module NT Header. Aborting.");
 
-    appInfo.modules.moduleBaseAddress = (size_t)pBaseAddress;
-    appInfo.modules.startAddress = ntHeader.OptionalHeader.BaseOfCode;
-    appInfo.modules.endAddress = appInfo.modules.startAddress + (size_t)ntHeader.OptionalHeader.SizeOfCode;
+    appInfo.modules[0].moduleBaseAddress = (size_t)pBaseAddress;
+    appInfo.modules[0].startAddress = ntHeader.OptionalHeader.BaseOfCode;
+    appInfo.modules[0].endAddress = appInfo.modules[0].startAddress + (size_t)ntHeader.OptionalHeader.SizeOfCode;
+    appInfo.modules[0].moduleEndAddress = appInfo.modules[0].moduleBaseAddress + appInfo.modules[0].endAddress;
     
     // Place Main Thread in Threads.
     {
@@ -420,7 +470,7 @@ int32_t main(void)
   
   puts("Evaluating Profiling Data...");
 
-  SEvalResult evaluation = EvaluateSession(pdbSession, profileSession);
+  SEvalResult evaluation = EvaluateSession(appInfo, profileSession);
 
   puts("Sorting Evaluation...");
 
@@ -443,6 +493,7 @@ int32_t main(void)
   // Explore Stackless Performance Evaluation.
   {
     SFuncLineOptions options;
+    options.disasmExpensiveLines = !noDisAsm;
 
     // Select a function to profile and display hits in the source file.
     while (true)
@@ -457,7 +508,7 @@ int32_t main(void)
       if (index == 0)
         break;
 
-      InstrumentFunctionWithSource(pdbSession, appInfo, evaluation, index - 1, options);
+      InstrumentFunctionWithSource(appInfo, evaluation, index - 1, options);
     }
   }
 
@@ -513,13 +564,21 @@ SProfileResult ProfileApplicationNoStackTrace(SAppInfo &appInfo, const SProfileO
       {
         if (threadContext.Rip != _thread.lastRip)
         {
-          const size_t relativeAddress = threadContext.Rip - appInfo.modules.moduleBaseAddress;
+          bool external = true;
 
-          if (relativeAddress < appInfo.modules.endAddress && relativeAddress >= appInfo.modules.startAddress)
+          for (size_t moduleIndex = 0; moduleIndex < appInfo.modules.size(); moduleIndex++)
           {
-            ret.directHits.emplace_back(relativeAddress);
+            const size_t relativeAddress = threadContext.Rip - appInfo.modules[moduleIndex].moduleBaseAddress;
+
+            if (relativeAddress < appInfo.modules[moduleIndex].endAddress && relativeAddress >= appInfo.modules[moduleIndex].startAddress)
+            {
+              ret.directHits.emplace_back(relativeAddress, (uint8_t)moduleIndex);
+              external = false;
+              break;
+            }
           }
-          else if (options.getStackTraceOnExtern)
+          
+          if (external && options.getStackTraceOnExtern)
           {
             if (options.fastStackTrace)
             {
@@ -527,7 +586,6 @@ SProfileResult ProfileApplicationNoStackTrace(SAppInfo &appInfo, const SProfileO
               size_t stackData[stackDataCount];
 
               size_t stackPosition = (threadContext.Rsp & ~(size_t)0x4) - sizeof(stackData) + sizeof(size_t);
-              const size_t moduleEndAddress = appInfo.modules.moduleBaseAddress + appInfo.modules.endAddress;
 
               bool found = false;
 
@@ -540,17 +598,23 @@ SProfileResult ProfileApplicationNoStackTrace(SAppInfo &appInfo, const SProfileO
 
                 for (int64_t i = stackDataCount - 1; i >= 0; i--)
                 {
-                  if (stackData[i] >= moduleEndAddress)
-                    break;
-
-                  const size_t virtualAddress = stackData[i] - appInfo.modules.moduleBaseAddress;
-
-                  if (virtualAddress >= appInfo.modules.startAddress)
+                  for (size_t moduleIndex = 0; moduleIndex < appInfo.modules.size(); moduleIndex++)
                   {
-                    ret.directHits.emplace_back(virtualAddress);
-                    found = true;
-                    break;
+                    if (stackData[i] >= appInfo.modules[moduleIndex].moduleEndAddress)
+                      break;
+
+                    const size_t virtualAddress = stackData[i] - appInfo.modules[moduleIndex].moduleBaseAddress;
+
+                    if (virtualAddress >= appInfo.modules[moduleIndex].startAddress)
+                    {
+                      ret.directHits.emplace_back(virtualAddress, (uint8_t)moduleIndex);
+                      found = true;
+                      break;
+                    }
                   }
+
+                  if (found)
+                    break;
                 }
 
                 if (found)
@@ -571,15 +635,24 @@ SProfileResult ProfileApplicationNoStackTrace(SAppInfo &appInfo, const SProfileO
               stackFrame.AddrStack.Offset = threadContext.Rsp;
               stackFrame.AddrStack.Mode = AddrModeFlat;
 
+              bool found = false;
+
               while (StackWalk64(IMAGE_FILE_MACHINE_AMD64, appInfo.processHandle, _thread.handle, &stackFrame, &threadContext, NULL, SymFunctionTableAccess64, SymGetModuleBase64, NULL))
               {
-                const size_t stackRelativeAddress = stackFrame.AddrPC.Offset - appInfo.modules.moduleBaseAddress;
-
-                if (stackFrame.AddrPC.Segment == 0 && stackRelativeAddress < appInfo.modules.endAddress && stackRelativeAddress >= appInfo.modules.startAddress)
+                for (size_t moduleIndex = 0; moduleIndex < appInfo.modules.size(); moduleIndex++)
                 {
-                  ret.directHits.emplace_back(stackRelativeAddress);
-                  break;
+                  const size_t stackRelativeAddress = stackFrame.AddrPC.Offset - appInfo.modules[moduleIndex].moduleBaseAddress;
+
+                  if (stackFrame.AddrPC.Segment == 0 && stackRelativeAddress < appInfo.modules[moduleIndex].endAddress && stackRelativeAddress >= appInfo.modules[moduleIndex].startAddress)
+                  {
+                    ret.directHits.emplace_back(stackRelativeAddress, (uint8_t)moduleIndex);
+                    found = true;
+                    break;
+                  }
                 }
+
+                if (found)
+                  break;
               }
             }
           }
@@ -622,12 +695,10 @@ void UpdateAppInfo(SAppInfo &appInfo, const DEBUG_EVENT &evnt)
   {
   case CREATE_THREAD_DEBUG_EVENT:
   {
-    HANDLE thread = OpenThread(THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME, FALSE, evnt.dwThreadId);
-
-    if (thread == INVALID_HANDLE_VALUE || thread == nullptr)
-      printf("Failed to open Thread %" PRIu32 " with error %" PRIu32 ".\n", evnt.dwThreadId, GetLastError());
+    if (evnt.u.CreateThread.hThread == INVALID_HANDLE_VALUE || evnt.u.CreateThread.hThread == nullptr)
+      printf("Invalid Thread Handle for ThreadId %" PRIu32 ".\n", evnt.dwThreadId);
     else
-      appInfo.threads.push_back({ evnt.dwThreadId, thread, 0 });
+      appInfo.threads.push_back({ evnt.dwThreadId, evnt.u.CreateThread.hThread, 0 });
 
     break;
   }
@@ -638,7 +709,6 @@ void UpdateAppInfo(SAppInfo &appInfo, const DEBUG_EVENT &evnt)
     {
       if (evnt.dwThreadId == appInfo.threads[i].threadId)
       {
-        CloseHandle(appInfo.threads[i].handle);
         appInfo.threads.erase(appInfo.threads.begin() + i);
         break;
       }
@@ -652,134 +722,111 @@ void UpdateAppInfo(SAppInfo &appInfo, const DEBUG_EVENT &evnt)
     break;
 
   case LOAD_DLL_DEBUG_EVENT:
+  {
+    wchar_t filename[MAX_PATH];
+
+    if (GetModuleFileName((HMODULE)evnt.u.LoadDll.lpBaseOfDll, filename, ARRAYSIZE(filename)))
+    {
+      SetConsoleColor(CC_DarkGray, CC_Black);
+      printf("Loaded DLL '%ws'.\n", filename);
+      SetConsoleColor(CC_BrightGray, CC_Black);
+    }
+
+    if (evnt.u.LoadDll.nDebugInfoSize != 0 && evnt.u.LoadDll.dwDebugInfoFileOffset != 0)
+    {
+
+    }
+
     break;
+  }
 
   case UNLOAD_DLL_DEBUG_EVENT:
+  {
     break;
+  }
   }
 }
 
 ////////////////////////////////////////////////////////////////////////////////
 
-DWORD EvaluateSymbol(_In_ const CComPtr<IDiaSymbol> &symbol, _Inout_ std::vector<SPerfEval> &evaluation, _Inout_ std::deque<size_t> &positions)
-{
-  DWORD virtualAddress;
-  DWORD tag;
-
-  if (symbol->get_relativeVirtualAddress(&virtualAddress) != S_OK)
-    virtualAddress = 0;
-  
-  if (SUCCEEDED(symbol->get_symTag(&tag)) && tag == SymTagFunction)
-  {
-    wchar_t *symbolName = nullptr;
-  
-    if (FAILED(symbol->get_name(&symbolName)))
-    {
-      if (symbolName != nullptr)
-        SysFreeString(symbolName);
-    }
-    else
-    {
-      SPerfEval func;
-      func.symbolStartPos = virtualAddress;
-      
-      size_t length;
-
-      if (FAILED(symbol->get_length(&length)))
-      {
-        SysFreeString(symbolName);
-        return virtualAddress;
-      }
-
-      func.symbolEndPos = virtualAddress + length;
-
-      while (positions.size() > 0 && positions[0] < virtualAddress) // Discard hits before this function. We're iterating linearly from front to back.
-        positions.pop_front(); // Let's hope this doesn't happen too much...
-
-      while (positions.size() > 0 && positions[0] >= virtualAddress && positions[0] < func.symbolEndPos)
-      {
-        func.hitsOffset.emplace_back((uint32_t)(positions.front() - virtualAddress));
-        positions.pop_front();
-      }
-
-      if (func.hitsOffset.size() > 0)
-      {
-        if (FAILED(symbol->get_addressSection(&func.sector)))
-          func.sector = (DWORD)-1;
-
-        if (FAILED(symbol->get_addressOffset(&func.offset)))
-          func.offset = (DWORD)-1;
-
-        CopyString(func.symbolName, sizeof(func.symbolName), symbolName);
-
-        evaluation.emplace_back(std::move(func));
-      }
-
-      SysFreeString(symbolName);
-    }
-  }
-
-  return virtualAddress;
-}
-
-SEvalResult EvaluateSession(_In_ CComPtr<IDiaSession> &session, _Inout_ SProfileResult &perfSession)
+SEvalResult EvaluateSession(SAppInfo &appInfo, _Inout_ SProfileResult &perfSession)
 {
   SEvalResult ret;
 
   std::sort(perfSession.directHits.begin(), perfSession.directHits.end());
 
-  CComPtr<IDiaSymbol> global;
-  FATAL_IF(FAILED(session->get_globalScope(&global)), "Failed to retrieve Global Scope.");
+  if (appInfo.inactiveModules.size() > 0)
+    appInfo.modules.insert(appInfo.modules.begin(), std::make_move_iterator(begin(appInfo.inactiveModules)), std::make_move_iterator(end(appInfo.inactiveModules)));
+  
+  const size_t startIndex = 0;
+  const size_t endIndex = perfSession.directHits.size();
 
-  DWORD id = 0;
-  FATAL_IF(FAILED(global->get_symIndexId(&id)) || id == 0, "Failed to retrieve Global Symbol Index ID.");
+  size_t i = startIndex;
 
-  CComPtr<IDiaEnumSymbolsByAddr> pEnumByAddr;
-  FATAL_IF(FAILED(session->getSymbolsByAddr(&pEnumByAddr)), "Failed to get Enumerator for Symbols by Address.");
-
-  CComPtr<IDiaSymbol> symbol;
-  FATAL_IF(FAILED(pEnumByAddr->symbolByAddr(1, 0, &symbol)), "Failed to get first Symbol from Enumerator");
-
-  DWORD lastVirtualAddress = 0;
-
-  if (SUCCEEDED(symbol->get_relativeVirtualAddress(&lastVirtualAddress)))
+  for (size_t moduleIndex = 0; moduleIndex < appInfo.modules.size(); moduleIndex++)
   {
-    symbol = nullptr;
-
-    FATAL_IF(FAILED(pEnumByAddr->symbolByRVA(lastVirtualAddress, &symbol)), "Failed to get Symbol from Enumerator.");
-
-    HRESULT hr;
-    ULONG fetchedSymbolCount = 0;
-
-    do
+    CComPtr<IDiaEnumSymbolsByAddr> enumByAddr;
+    
+    if (FAILED(appInfo.modules[moduleIndex].pdbSession->getSymbolsByAddr(&enumByAddr)))
     {
-      lastVirtualAddress = EvaluateSymbol(symbol, ret.eval, perfSession.directHits);
+      printf("Failed to get Iterator for Module '%ws'. Skipping Module.\n", appInfo.modules[moduleIndex].moduleName);
+      continue;
+    }  
 
-      symbol = nullptr;
-      fetchedSymbolCount = 0;
+    for (; i < endIndex; i++)
+    {
+      const SProfileHit hit = perfSession.directHits[i];
 
-      if (FAILED(hr = pEnumByAddr->Next(1, &symbol, &fetchedSymbolCount)))
+      if (hit.GetModule() != (uint8_t)moduleIndex)
         break;
 
-    } while (fetchedSymbolCount == 1);
+      CComPtr<IDiaSymbol> symbol;
 
-    symbol = nullptr;
+      if (FAILED(enumByAddr->symbolByAddr(1, (DWORD)(hit.GetAddress() - appInfo.modules[moduleIndex].startAddress), &symbol)) || symbol == nullptr)
+        continue;
 
-    FATAL_IF(FAILED(pEnumByAddr->symbolByRVA(lastVirtualAddress, &symbol)), "Failed to retrieve Symbol by RVA.");
+      DWORD virtualAddress;
+      wchar_t *symbolName = nullptr;
+      size_t length;
 
-    do
-    {
-      lastVirtualAddress = EvaluateSymbol(symbol, ret.eval, perfSession.directHits);
+      if (FAILED(symbol->get_relativeVirtualAddress(&virtualAddress)) || FAILED(symbol->get_name(&symbolName)) || FAILED(symbol->get_length(&length)))
+      {
+        if (symbolName != nullptr)
+          SysFreeString(symbolName);
 
-      symbol = nullptr;
-      fetchedSymbolCount = 0;
+        continue;
+      }
 
-      if (FAILED(hr = pEnumByAddr->Prev(1, &symbol, &fetchedSymbolCount)))
-        break;
+      SPerfEval func;
+      func.symbolStartPos = virtualAddress;
+      func.symbolEndPos = func.symbolStartPos + length;
 
-    } while (fetchedSymbolCount == 1);
+      CopyString(func.symbolName, sizeof(func.symbolName), appInfo.modules[func.moduleIndex].moduleName);
+      StrCatBuffW(func.symbolName, L" - ", sizeof(func.symbolName));
+      StrCatBuffW(func.symbolName, symbolName, sizeof(func.symbolName));
+      SysFreeString(symbolName);
 
-    FATAL_IF(FAILED(hr), "Failed to retrieve next element.");
+      if (FAILED(symbol->get_addressSection(&func.sector)))
+        func.sector = (DWORD)-1;
+
+      if (FAILED(symbol->get_addressOffset(&func.offset)))
+        func.offset = (DWORD)-1;
+
+      func.hitsOffset.emplace_back((uint32_t)(hit.GetAddress() - func.symbolStartPos));
+
+      while (endIndex > i + 1)
+      {
+        const SProfileHit nextHit = perfSession.directHits[i + 1];
+
+        if (nextHit.GetModule() != hit.GetModule() || nextHit.GetAddress() > func.symbolEndPos)
+          break;
+
+        i++;
+        func.hitsOffset.emplace_back((uint32_t)(nextHit.GetAddress() - func.symbolStartPos));
+      }
+
+      ret.eval.emplace_back(std::move(func));
+    }
   }
 
   return ret;
@@ -881,12 +928,12 @@ bool GetDetailedEvaluation(_In_ CComPtr<IDiaSession> &session, _In_ const SPerfE
 
 ////////////////////////////////////////////////////////////////////////////////
 
-bool LoadBinary(SAppInfo &appInfo)
+bool LoadBinary(SAppInfo &appInfo, const size_t moduleIndex)
 {
-  if (appInfo.modules.pBinary != nullptr)
-    return appInfo.modules.hasDisasm;
+  if (appInfo.modules[moduleIndex].pBinary != nullptr)
+    return appInfo.modules[moduleIndex].hasDisasm;
 
-  FILE *pFile = _wfopen(appInfo.modules.sourceFile, L"rb");
+  FILE *pFile = _wfopen(appInfo.modules[moduleIndex].filename, L"rb");
   ERROR_RETURN_IF(pFile == nullptr, "Failed to open binary file.");
 
   auto defer_fclose = std::unique_ptr<FILE, int (*)(FILE *)>(pFile, fclose);
@@ -906,13 +953,13 @@ bool LoadBinary(SAppInfo &appInfo)
     ERROR_RETURN_IF(true, "Failed to read file.");
   }
 
-  appInfo.modules.pBinary = fileContents;
-  appInfo.modules.binaryLength = fileSize;
+  appInfo.modules[moduleIndex].pBinary = fileContents;
+  appInfo.modules[moduleIndex].binaryLength = fileSize;
 
-  ERROR_RETURN_IF(!ZYAN_SUCCESS(ZydisDecoderInit(&appInfo.modules.decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_ADDRESS_WIDTH_64)), "Failed to initialize disassembler.");
-  ERROR_RETURN_IF(!ZYAN_SUCCESS(ZydisFormatterInit(&appInfo.modules.formatter, ZYDIS_FORMATTER_STYLE_INTEL)) || !ZYAN_SUCCESS(ZydisFormatterSetProperty(&appInfo.modules.formatter, ZYDIS_FORMATTER_PROP_FORCE_SEGMENT, ZYAN_TRUE)) || !ZYAN_SUCCESS(ZydisFormatterSetProperty(&appInfo.modules.formatter, ZYDIS_FORMATTER_PROP_FORCE_SIZE, ZYAN_TRUE)), "Failed to initialize instruction formatter.");
+  ERROR_RETURN_IF(!ZYAN_SUCCESS(ZydisDecoderInit(&appInfo.modules[moduleIndex].decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_ADDRESS_WIDTH_64)), "Failed to initialize disassembler.");
+  ERROR_RETURN_IF(!ZYAN_SUCCESS(ZydisFormatterInit(&appInfo.modules[moduleIndex].formatter, ZYDIS_FORMATTER_STYLE_INTEL)) || !ZYAN_SUCCESS(ZydisFormatterSetProperty(&appInfo.modules[moduleIndex].formatter, ZYDIS_FORMATTER_PROP_FORCE_SEGMENT, ZYAN_TRUE)) || !ZYAN_SUCCESS(ZydisFormatterSetProperty(&appInfo.modules[moduleIndex].formatter, ZYDIS_FORMATTER_PROP_FORCE_SIZE, ZYAN_TRUE)), "Failed to initialize instruction formatter.");
 
-  appInfo.modules.hasDisasm = true;
+  appInfo.modules[moduleIndex].hasDisasm = true;
 
   return true;
 }
@@ -928,7 +975,7 @@ bool InstrumentDisassembly(SAppInfo &appInfo, const SPerfEval &function, const s
   ZydisDecodedInstruction instruction;
   char disasmBuffer[1024] = {};
 
-  const uint8_t *pBinaryAtAddress = appInfo.modules.pBinary;
+  const uint8_t *pBinaryAtAddress = appInfo.modules[function.moduleIndex].pBinary;
 
   IMAGE_DOS_HEADER *pDosHeader = (IMAGE_DOS_HEADER *)pBinaryAtAddress;
   IMAGE_NT_HEADERS *pNtHeaders = (IMAGE_NT_HEADERS *)(pBinaryAtAddress + pDosHeader->e_lfanew);
@@ -965,12 +1012,15 @@ bool InstrumentDisassembly(SAppInfo &appInfo, const SPerfEval &function, const s
       hitIndex++;
     }
 
+    ERROR_RETURN_IF(!(ZYAN_SUCCESS(ZydisDecoderDecodeBuffer(&appInfo.modules[function.moduleIndex].decoder, pBinaryAtAddress, endAddress - virtualAddress, &instruction))), "Invalid Instruction at 0x%" PRIX64 ".", virtualAddress);
+    ERROR_RETURN_IF(!ZYAN_SUCCESS(ZydisFormatterFormatInstruction(&appInfo.modules[function.moduleIndex].formatter, &instruction, disasmBuffer, sizeof(disasmBuffer), virtualAddress)), "Failed to Format Instruction at 0x%" PRIX64 ".", virtualAddress);
+
     SetConsoleColor(hits > expensiveThreshold ? CC_BrightCyan : CC_DarkCyan, CC_Black);
 
-    ERROR_RETURN_IF(!(ZYAN_SUCCESS(ZydisDecoderDecodeBuffer(&appInfo.modules.decoder, pBinaryAtAddress, endAddress - virtualAddress, &instruction))), "Invalid Instruction at 0x%" PRIX64 ".", virtualAddress);
-    ERROR_RETURN_IF(!ZYAN_SUCCESS(ZydisFormatterFormatInstruction(&appInfo.modules.formatter, &instruction, disasmBuffer, sizeof(disasmBuffer), virtualAddress)), "Failed to Format Instruction at 0x%" PRIX64 ".", virtualAddress);
-
-    printf("       % 5" PRIu64 " | %s\n", hits, disasmBuffer);
+    if (hits > 0)
+      printf("0x%08" PRIX64 " | % 5" PRIu64 " | %s\n", virtualAddress, hits, disasmBuffer);
+    else
+      printf("0x%08" PRIX64 " |       | %s\n", virtualAddress, disasmBuffer);
 
     virtualAddress += instruction.length;
     pBinaryAtAddress += instruction.length;
@@ -986,22 +1036,53 @@ bool InstrumentDisassembly(SAppInfo &appInfo, const SPerfEval &function, const s
   return true;
 }
 
+bool InstrumentFunctionDisassembly(SAppInfo &appInfo, const SPerfEval &function, const SFuncLineOptions &options)
+{
+  size_t maxHit = 0;
+  size_t currentHits = 0;
+  uint32_t currentOffset = 0;
+
+  for (const auto &_hit : function.hitsOffset)
+  {
+    if (_hit != currentOffset)
+    {
+      maxHit = max(maxHit, currentHits);
+
+      currentHits = 0;
+      currentOffset = _hit;
+    }
+
+    currentHits++;
+  }
+
+  maxHit = max(maxHit, currentHits);
+
+  const bool result = InstrumentDisassembly(appInfo, function, function.symbolStartPos, function.symbolEndPos, options, maxHit);
+  
+  SetConsoleColor(CC_BrightGray, CC_Black);
+
+  return result;
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 
-bool InstrumentFunctionWithSource(CComPtr<IDiaSession> &pdbSession, SAppInfo &appInfo, const SEvalResult &evaluation, const size_t index, const SFuncLineOptions &options)
+bool InstrumentFunctionWithSource(SAppInfo &appInfo, const SEvalResult &evaluation, const size_t index, const SFuncLineOptions &options)
 {
   ERROR_RETURN_IF(evaluation.eval.size() <= index, "Invalid Index.");
 
   const SPerfEval &function = evaluation.eval[index];
-  const bool showDisasm = options.disasmExpensiveLines && LoadBinary(appInfo);
+  const bool showDisasm = options.disasmExpensiveLines && LoadBinary(appInfo, function.moduleIndex);
 
   printf("\nDetails for '%ws':\n\n", function.symbolName);
 
   SFuncEval lineEval;
 
-  if (!GetDetailedEvaluation(pdbSession, function, lineEval) || lineEval.lines.size() == 0)
+  if (!GetDetailedEvaluation(appInfo.modules[function.moduleIndex].pdbSession, function, lineEval) || lineEval.lines.size() == 0)
   {
     puts("Failed to retrieve detailed evaluation.");
+
+    if (showDisasm)
+      InstrumentFunctionDisassembly(appInfo, function, options);
   }
   else
   {
@@ -1015,6 +1096,8 @@ bool InstrumentFunctionWithSource(CComPtr<IDiaSession> &pdbSession, SAppInfo &ap
     const size_t relevantThreshold = (size_t)(maximumLineHits * options.relevantLineThreshold);
     const size_t disasmThreshold = (size_t)(maximumLineHits * options.disasmLineThreshold);
 
+    bool failedFileDisasmShown = false;
+
     for (size_t i = 0; i < lineEval.lines.size(); i++)
     {
       const size_t fileIndex = lineEval.lines[i].fileIndex;
@@ -1027,29 +1110,10 @@ bool InstrumentFunctionWithSource(CComPtr<IDiaSession> &pdbSession, SAppInfo &ap
       {
         printf("Failed to read file '%ws'.\n", lineEval.files[fileIndex].filename);
 
-        if (showDisasm)
+        if (showDisasm && !failedFileDisasmShown)
         {
-          size_t maxHit = 0;
-          size_t currentHits = 0;
-          uint32_t currentOffset = 0;
-
-          for (const auto &_hit : function.hitsOffset)
-          {
-            if (_hit != currentOffset)
-            {
-              maxHit = max(maxHit, currentHits);
-
-              currentHits = 0;
-              currentOffset = _hit;
-            }
-            
-            currentHits++;
-          }
-
-          maxHit = max(maxHit, currentHits);
-
-          InstrumentDisassembly(appInfo, function, function.symbolStartPos, function.symbolEndPos, options, maxHit);
-          SetConsoleColor(CC_BrightGray, CC_Black);
+          InstrumentFunctionDisassembly(appInfo, function, options);
+          failedFileDisasmShown = true;
         }
 
         while (lineEval.lines.size() > 1 && lineEval.lines[i + 1].fileIndex == fileIndex)
@@ -1104,7 +1168,7 @@ bool InstrumentFunctionWithSource(CComPtr<IDiaSession> &pdbSession, SAppInfo &ap
       // Print Empty Lines.
       while (currentLine < targetLine && offset < fileSize)
       {
-        printf("#% 5" PRIu64 "       | %s\n", currentLine, fileContents + offset);
+        printf("# % 8" PRIu64 " |       | %s\n", currentLine, fileContents + offset);
 
         offset += strlen(fileContents + offset) + 1;
         currentLine++;
@@ -1116,7 +1180,7 @@ bool InstrumentFunctionWithSource(CComPtr<IDiaSession> &pdbSession, SAppInfo &ap
 
       // Print Line With Hits.
       {
-        printf("#% 5" PRIu64 " % 5" PRIu64 " | %s\n", currentLine, lineEval.lines[i].hits, fileContents + offset);
+        printf("# % 8" PRIu64 " | % 5" PRIu64 " | %s\n", currentLine, lineEval.lines[i].hits, fileContents + offset);
 
         if (showDisasm && lineEval.lines[i].hits > disasmThreshold)
           InstrumentDisassembly(appInfo, function, lineEval.lines[i].startAddress, lineEval.lines[i].endAddress, options, maximumLineHits);
@@ -1135,7 +1199,7 @@ bool InstrumentFunctionWithSource(CComPtr<IDiaSession> &pdbSession, SAppInfo &ap
         // Print Empty Lines.
         while (currentLine < targetLine && offset < fileSize)
         {
-          printf("#% 5" PRIu64 "       | %s\n", currentLine, fileContents + offset);
+          printf("# % 8" PRIu64 " |       | %s\n", currentLine, fileContents + offset);
 
           offset += strlen(fileContents + offset) + 1;
           currentLine++;
@@ -1147,7 +1211,7 @@ bool InstrumentFunctionWithSource(CComPtr<IDiaSession> &pdbSession, SAppInfo &ap
 
         // Print Line With Hits.
         {
-          printf("#% 5" PRIu64 " % 5" PRIu64 " | %s\n", currentLine, lineEval.lines[i].hits, fileContents + offset);
+          printf("# % 8" PRIu64 " | % 5" PRIu64 " | %s\n", currentLine, lineEval.lines[i].hits, fileContents + offset);
 
           if (showDisasm && lineEval.lines[i].hits > disasmThreshold)
             InstrumentDisassembly(appInfo, function, lineEval.lines[i].startAddress, lineEval.lines[i].endAddress, options, maximumLineHits);
@@ -1163,7 +1227,7 @@ bool InstrumentFunctionWithSource(CComPtr<IDiaSession> &pdbSession, SAppInfo &ap
 
       while (currentLine < targetLine && offset < fileSize)
       {
-        printf("#% 5" PRIu64 "       | %s\n", currentLine, fileContents + offset);
+        printf("# % 8" PRIu64 " |       | %s\n", currentLine, fileContents + offset);
 
         offset += strlen(fileContents + offset) + 1;
         currentLine++;
