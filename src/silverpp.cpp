@@ -298,7 +298,7 @@ int32_t main(void)
     }
     else if (wcscmp(pArgv[argIndex], _CMD_PARAM_ARGS) == 0 && argsRemaining > 1)
     {
-      args = commandLine;
+      args = commandLine + wcslen(pArgv[0]) + wcslen(pArgv[1]) + 2;
 
       while (args[sizeof(_CMD_PARAM_ARGS_SPACE)] == '\0' || memcmp(args, _CMD_PARAM_ARGS_SPACE, sizeof(_CMD_PARAM_ARGS_SPACE) - sizeof(wchar_t)) != 0)
         args++;
@@ -341,8 +341,11 @@ int32_t main(void)
     ZeroMemory(&startupInfo, sizeof(startupInfo));
     startupInfo.cb = sizeof(startupInfo);
 
-    printf("Attempting to launch '%ws'...\n", appPath);
-
+    if (wcslen(args) == 0)
+      printf("Attempting to launch '%ws'...\n", appPath);
+    else
+      printf("Attempting to launch '%ws' with arguments '%ws'...\n", appPath, args);
+    
     FATAL_IF(!CreateProcessW(appPath, args, NULL, NULL, FALSE, DEBUG_PROCESS | CREATE_NEW_CONSOLE, NULL, workingDirectory, &startupInfo, &processInfo), "Unable to start process. Aborting.");
   }
 
