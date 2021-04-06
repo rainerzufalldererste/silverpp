@@ -80,8 +80,11 @@ struct SPerfEval
   }
 };
 
+static uint8_t _NextModuleIndex = 1;
+
 struct SModuleInfo
 {
+
   size_t moduleBaseAddress;
   size_t moduleEndAddress;
   size_t startAddress;
@@ -90,6 +93,7 @@ struct SModuleInfo
   wchar_t *moduleName = L"<UNKNOWN>";
   uint8_t *pBinary = nullptr;
   size_t binaryLength = 0;
+  uint8_t moduleIndex;
 
   bool hasDisasm = false;
 
@@ -104,6 +108,11 @@ struct SModuleInfo
   {
     if (pBinary != nullptr)
       free(pBinary);
+  }
+
+  inline bool operator < (const SModuleInfo &other)
+  {
+    return moduleIndex < other.moduleIndex;
   }
 };
 
@@ -424,6 +433,7 @@ int32_t main(void)
   appInfo.modules.emplace_back();
   CopyString(appInfo.modules[0].filename, sizeof(appInfo.modules[0].filename), appPath);
   appInfo.modules[0].moduleName = PathFindFileNameW(appInfo.modules[0].filename);
+  appInfo.modules[0].moduleIndex = 0;
 
   // Attempt to read PDB.
   {
@@ -746,13 +756,13 @@ SProfileResult ProfileApplicationNoStackTrace(SAppInfo &appInfo, const SProfileO
         {
           bool external = true;
 
-          for (size_t moduleIndex = 0; moduleIndex < appInfo.modules.size(); moduleIndex++)
+          for (const auto &_module : appInfo.modules)
           {
-            const size_t relativeAddress = threadContext.Rip - appInfo.modules[moduleIndex].moduleBaseAddress;
+            const size_t relativeAddress = threadContext.Rip - _module.moduleBaseAddress;
 
-            if (relativeAddress < appInfo.modules[moduleIndex].endAddress && relativeAddress >= appInfo.modules[moduleIndex].startAddress)
+            if (relativeAddress < _module.endAddress && relativeAddress >= _module.startAddress)
             {
-              ret.directHits.emplace_back(relativeAddress, (uint8_t)moduleIndex);
+              ret.directHits.emplace_back(relativeAddress, (uint8_t)_module.moduleIndex);
               external = false;
               break;
             }
@@ -778,16 +788,16 @@ SProfileResult ProfileApplicationNoStackTrace(SAppInfo &appInfo, const SProfileO
 
                 for (int64_t i = stackDataCount - 1; i >= 0; i--)
                 {
-                  for (size_t moduleIndex = 0; moduleIndex < appInfo.modules.size(); moduleIndex++)
+                  for (const auto &_module : appInfo.modules)
                   {
-                    if (stackData[i] >= appInfo.modules[moduleIndex].moduleEndAddress)
+                    if (stackData[i] >= _module.moduleEndAddress)
                       break;
 
-                    const size_t virtualAddress = stackData[i] - appInfo.modules[moduleIndex].moduleBaseAddress;
+                    const size_t virtualAddress = stackData[i] - _module.moduleBaseAddress;
 
-                    if (virtualAddress >= appInfo.modules[moduleIndex].startAddress)
+                    if (virtualAddress >= _module.startAddress)
                     {
-                      ret.directHits.emplace_back(virtualAddress, (uint8_t)moduleIndex);
+                      ret.directHits.emplace_back(virtualAddress, (uint8_t)_module.moduleIndex);
                       found = true;
                       break;
                     }
@@ -819,13 +829,13 @@ SProfileResult ProfileApplicationNoStackTrace(SAppInfo &appInfo, const SProfileO
 
               while (StackWalk64(IMAGE_FILE_MACHINE_AMD64, appInfo.processHandle, _thread.handle, &stackFrame, &threadContext, NULL, SymFunctionTableAccess64, SymGetModuleBase64, NULL))
               {
-                for (size_t moduleIndex = 0; moduleIndex < appInfo.modules.size(); moduleIndex++)
+                for (const auto &_module : appInfo.modules)
                 {
-                  const size_t stackRelativeAddress = stackFrame.AddrPC.Offset - appInfo.modules[moduleIndex].moduleBaseAddress;
+                  const size_t stackRelativeAddress = stackFrame.AddrPC.Offset - _module.moduleBaseAddress;
 
-                  if (stackFrame.AddrPC.Segment == 0 && stackRelativeAddress < appInfo.modules[moduleIndex].endAddress && stackRelativeAddress >= appInfo.modules[moduleIndex].startAddress)
+                  if (stackFrame.AddrPC.Segment == 0 && stackRelativeAddress < _module.endAddress && stackRelativeAddress >= _module.startAddress)
                   {
-                    ret.directHits.emplace_back(stackRelativeAddress, (uint8_t)moduleIndex);
+                    ret.directHits.emplace_back(stackRelativeAddress, (uint8_t)_module.moduleIndex);
                     found = true;
                     break;
                   }
@@ -944,6 +954,7 @@ void UpdateAppInfo(SAppInfo &appInfo, const DEBUG_EVENT &evnt)
             info.startAddress = ntHeader.OptionalHeader.BaseOfCode;
             info.endAddress = appInfo.modules[0].startAddress + (size_t)ntHeader.OptionalHeader.SizeOfCode;
             info.moduleEndAddress = appInfo.modules[0].moduleBaseAddress + appInfo.modules[0].endAddress;
+            info.moduleIndex = _NextModuleIndex++;
 
             appInfo.modules.push_back(info);
 
@@ -1026,7 +1037,10 @@ SEvalResult EvaluateSession(SAppInfo &appInfo, _Inout_ SProfileResult &perfSessi
   std::sort(perfSession.directHits.begin() + startIndex, perfSession.directHits.begin() + endIndex);
 
   if (appInfo.inactiveModules.size() > 0)
+  {
     appInfo.modules.insert(appInfo.modules.begin(), std::make_move_iterator(begin(appInfo.inactiveModules)), std::make_move_iterator(end(appInfo.inactiveModules)));
+    std::sort(appInfo.modules.begin(), appInfo.modules.end());
+  }
 
   size_t i = startIndex;
 
@@ -1339,6 +1353,7 @@ bool InstrumentDisassembly(SAppInfo &appInfo, const SPerfEval &function, const s
     switch (instruction.mnemonic)
     {
     case ZYDIS_MNEMONIC_CALL:
+    case ZYDIS_MNEMONIC_JMP:
     case ZYDIS_MNEMONIC_JB:
     case ZYDIS_MNEMONIC_JBE:
     case ZYDIS_MNEMONIC_JCXZ:
@@ -1346,6 +1361,10 @@ bool InstrumentDisassembly(SAppInfo &appInfo, const SPerfEval &function, const s
     case ZYDIS_MNEMONIC_JKNZD:
     case ZYDIS_MNEMONIC_JKZD:
     case ZYDIS_MNEMONIC_JL:
+    case ZYDIS_MNEMONIC_JZ:
+    case ZYDIS_MNEMONIC_JS:
+    case ZYDIS_MNEMONIC_JO:
+    case ZYDIS_MNEMONIC_JP:
     case ZYDIS_MNEMONIC_JLE:
     case ZYDIS_MNEMONIC_JNB:
     case ZYDIS_MNEMONIC_JNBE:
@@ -1375,14 +1394,14 @@ bool InstrumentDisassembly(SAppInfo &appInfo, const SPerfEval &function, const s
             wchar_t *symbolName = nullptr;
             size_t symbolStartAddress = 0;
 
-            if (SUCCEEDED(_module.pdbSession->getSymbolsByAddr(&enumerator)) && SUCCEEDED(enumerator->symbolByAddr(1, mappedAddress - _module.moduleBaseAddress - _module.startAddress, &symbol)) && SUCCEEDED(symbol->get_name(&symbolName)) && SUCCEEDED(symbol->get_virtualAddress(&symbolStartAddress)))
+            if (SUCCEEDED(_module.pdbSession->getSymbolsByAddr(&enumerator)) && SUCCEEDED(enumerator->symbolByAddr(1, (DWORD)(mappedAddress - _module.moduleBaseAddress - _module.startAddress), &symbol)) && SUCCEEDED(symbol->get_name(&symbolName)) && SUCCEEDED(symbol->get_virtualAddress(&symbolStartAddress)))
             {
               if (moduleIndex != (size_t)function.moduleIndex)
                 printf("\t\t\t\t[%ws - ", _module.moduleName);
               else
-                printf("\t\t\t\t[", _module.moduleName);
+                printf("\t\t\t\t[");
 
-              if (symbolStartAddress == function.symbolStartPos)
+              if (symbolStartAddress == function.symbolStartPos && moduleIndex == (size_t)function.moduleIndex)
               {
                 printf("%+" PRIi64 " (0x%08" PRIX64 ")]", operandAddress - virtualAddress, operandAddress);
               }
