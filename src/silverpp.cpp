@@ -212,7 +212,7 @@ struct SFuncLineOptions
   float relevantLineThreshold = 0.1;
   float disasmLineThreshold = 0.3;
   float expensiveAsmThreshold = 0.1;
-  size_t minAsmSamples = 20;
+  size_t minAsmSamples = 8;
 };
 
 inline bool CompareHits(const SLineEval &a, const SLineEval &b)
@@ -1206,6 +1206,52 @@ bool LoadBinary(SAppInfo &appInfo, const size_t moduleIndex)
 
 ////////////////////////////////////////////////////////////////////////////////
 
+uint64_t _GetAddressFromOperand(const ZydisDecodedInstruction *pInstruction, const size_t operatorIndex, const size_t virtualAddress)
+{
+  uint64_t ptr = 0;
+
+  switch (pInstruction->operands[operatorIndex].type)
+  {
+  case ZYDIS_OPERAND_TYPE_IMMEDIATE:
+  {
+    if (pInstruction->mnemonic == ZYDIS_MNEMONIC_MOV || pInstruction->mnemonic == ZYDIS_MNEMONIC_LEA)
+      return (uint64_t)-1;
+
+    if (pInstruction->operands[operatorIndex].imm.is_relative)
+      ptr = (uint64_t)(virtualAddress + pInstruction->length);
+
+    if (pInstruction->operands[operatorIndex].imm.is_signed)
+      ptr = (int64_t)ptr + (int64_t)(pInstruction->operands[operatorIndex].imm.value.s);
+    else
+      ptr = (uint64_t)(pInstruction->operands[operatorIndex].imm.value.u);
+
+    break;
+  }
+
+  case ZYDIS_OPERAND_TYPE_MEMORY:
+  {
+    if (pInstruction->operands[operatorIndex].mem.segment != ZYDIS_REGISTER_DS)
+      return (uint64_t)-1;
+
+    if (pInstruction->operands[operatorIndex].mem.base == ZYDIS_REGISTER_RIP)
+      ptr = virtualAddress + pInstruction->length + pInstruction->operands[operatorIndex].mem.disp.value;
+    else
+      return (uint64_t)-1;
+
+    break;
+  }
+
+  case ZYDIS_OPERAND_TYPE_POINTER:
+  {
+    if (pInstruction->operands[operatorIndex].ptr.segment != ZYDIS_REGISTER_DS)
+      return (uint64_t)-1;
+
+    ptr = virtualAddress + pInstruction->length + pInstruction->operands[operatorIndex].ptr.offset; // TODO: Is this valid?
+  }
+  }
+  return ptr;
+}
+
 bool InstrumentDisassembly(SAppInfo &appInfo, const SPerfEval &function, const size_t startAddress, const size_t endAddress, const SFuncLineOptions &options, const size_t maxLineHits)
 {
   if (startAddress == endAddress)
@@ -1258,9 +1304,88 @@ bool InstrumentDisassembly(SAppInfo &appInfo, const SPerfEval &function, const s
     SetConsoleColor(hits > expensiveThreshold ? CC_BrightCyan : CC_DarkCyan, CC_Black);
 
     if (hits > 0)
-      printf("0x%08" PRIX64 " | % 5" PRIu64 " | %s\n", virtualAddress, hits, disasmBuffer);
+      printf("0x%08" PRIX64 " | % 5" PRIu64 " | %s", virtualAddress, hits, disasmBuffer);
     else
-      printf("0x%08" PRIX64 " |       | %s\n", virtualAddress, disasmBuffer);
+      printf("0x%08" PRIX64 " |       | %s", virtualAddress, disasmBuffer);
+
+    switch (instruction.mnemonic)
+    {
+    case ZYDIS_MNEMONIC_CALL:
+    case ZYDIS_MNEMONIC_JB:
+    case ZYDIS_MNEMONIC_JBE:
+    case ZYDIS_MNEMONIC_JCXZ:
+    case ZYDIS_MNEMONIC_JECXZ:
+    case ZYDIS_MNEMONIC_JKNZD:
+    case ZYDIS_MNEMONIC_JKZD:
+    case ZYDIS_MNEMONIC_JL:
+    case ZYDIS_MNEMONIC_JLE:
+    case ZYDIS_MNEMONIC_JNB:
+    case ZYDIS_MNEMONIC_JNBE:
+    case ZYDIS_MNEMONIC_JNL:
+    case ZYDIS_MNEMONIC_JNLE:
+    case ZYDIS_MNEMONIC_JNO:
+    case ZYDIS_MNEMONIC_JNP:
+    case ZYDIS_MNEMONIC_JNS:
+    case ZYDIS_MNEMONIC_JNZ:
+    {
+      const uint64_t operandAddress = _GetAddressFromOperand(&instruction, 0, virtualAddress);
+
+      if (operandAddress != (uint64_t)-1)
+      {
+        const uint64_t mappedAddress = operandAddress + appInfo.modules[function.moduleIndex].moduleBaseAddress;
+
+        size_t moduleIndex = (size_t)-1;
+
+        for (const auto &_module : appInfo.modules)
+        {
+          ++moduleIndex;
+
+          if (mappedAddress >= _module.moduleBaseAddress && mappedAddress < _module.moduleEndAddress)
+          {
+            CComPtr<IDiaEnumSymbolsByAddr> enumerator;
+            CComPtr<IDiaSymbol> symbol;
+            wchar_t *symbolName = nullptr;
+            size_t symbolStartAddress = 0;
+
+            if (SUCCEEDED(_module.pdbSession->getSymbolsByAddr(&enumerator)) && SUCCEEDED(enumerator->symbolByAddr(1, mappedAddress - _module.moduleBaseAddress - _module.startAddress, &symbol)) && SUCCEEDED(symbol->get_name(&symbolName)) && SUCCEEDED(symbol->get_virtualAddress(&symbolStartAddress)))
+            {
+              if (moduleIndex != (size_t)function.moduleIndex)
+                printf("\t\t\t\t[%ws - ", _module.moduleName);
+              else
+                printf("\t\t\t\t[", _module.moduleName);
+
+              if (symbolStartAddress == function.symbolStartPos)
+              {
+                printf("%+" PRIi64 " (0x%08" PRIX64 ")]", operandAddress - virtualAddress, operandAddress);
+              }
+              else
+              {
+                const size_t offset = (mappedAddress - _module.moduleBaseAddress) - symbolStartAddress;
+
+                if (offset == 0)
+                  printf("%ws]", symbolName);
+                else
+                  printf("%ws + 0x%" PRIX64 "]", symbolName, offset);
+              }
+            }
+            else
+            {
+              printf("\t\t\t\t[%ws - <UNKNOWN_FUNCTION>]", _module.moduleName);
+            }
+
+            if (symbolName != nullptr)
+              SysFreeString(symbolName);
+
+            break;
+          }
+        }
+      }
+
+      break;
+    }
+    }
+
+    puts("");
 
     virtualAddress += instruction.length;
     pBinaryAtAddress += instruction.length;
