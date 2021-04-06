@@ -92,6 +92,7 @@ struct SProfileOptions
   bool fastStackTrace = false;
   bool alwaysGetStackTrace = false;
   bool favorPerformance = true;
+  size_t samplingDelay = 0;
 };
 
 struct SProfileHit
@@ -211,6 +212,7 @@ struct SFuncLineOptions
   float relevantLineThreshold = 0.1;
   float disasmLineThreshold = 0.3;
   float expensiveAsmThreshold = 0.1;
+  size_t minAsmSamples = 20;
 };
 
 inline bool CompareHits(const SLineEval &a, const SLineEval &b)
@@ -278,6 +280,9 @@ wchar_t _CMD_PARAM_FAST_STACK_TRACE[] = TEXT(CMD_PARAM_FAST_STACK_TRACE);
 #define CMD_PARAM_FAVOR_ACCURACY "--favor-accuracy"
 wchar_t _CMD_PARAM_FAVOR_ACCURACY[] = TEXT(CMD_PARAM_FAVOR_ACCURACY);
 
+#define CMD_PARAM_SAMPLING_DELAY "--delay"
+wchar_t _CMD_PARAM_SAMPLING_DELAY[] = TEXT(CMD_PARAM_SAMPLING_DELAY);
+
 #define CMD_PARAM_NO_DISASM "--no-disasm"
 wchar_t _CMD_PARAM_NO_DISASM[] = TEXT(CMD_PARAM_NO_DISASM);
 
@@ -296,7 +301,7 @@ int32_t main(void)
 
   int32_t argc = 0;
   wchar_t **pArgv = CommandLineToArgvW(commandLine, &argc);
-  FATAL_IF(argc == 1, "\nUsage: silverpp <ExecutablePath>\n\n Optional Parameters:\n\n\t[ " CMD_PARAM_INDIRECT_HITS " ]\t | Trace external Samples back to the calling Function\n\t[ " CMD_PARAM_STACK_TRACE " ]\t\t | Capture Stack Traces for all Samples\n\t[ " CMD_PARAM_FAST_STACK_TRACE " ]\t | Fast (but possibly less accurate) Stack Traces\n\t[ " CMD_PARAM_FAVOR_ACCURACY " ]\t | Favor Sampling Accuracy over Application Performance\n\t[ " CMD_PARAM_NO_DISASM " ]\t\t | Don't display disassembly for expensive lines\n\t[ " CMD_PARAM_VERBOSE " ]\t\t | Enable verbose logging\n\t[ " CMD_PARAM_ARGS_PASS_THROUGH " <Args> ]\t | Pass the remaining Arguments to the Application being profiled\n");
+  FATAL_IF(argc == 1, "\nUsage: silverpp <ExecutablePath>\n\n Optional Parameters:\n\n\t" CMD_PARAM_INDIRECT_HITS "\t\t | Trace external Samples back to the calling Function\n\t" CMD_PARAM_STACK_TRACE "\t\t\t | Capture Stack Traces for all Samples\n\t" CMD_PARAM_FAST_STACK_TRACE "\t\t | Fast (but possibly less accurate) Stack Traces\n\t" CMD_PARAM_FAVOR_ACCURACY "\t | Favor Sampling Accuracy over Application Performance\n\t" CMD_PARAM_SAMPLING_DELAY " <milliseconds>\t | Additional Sampling Delay (Improves performance at the cost of Samples)\n\t" CMD_PARAM_NO_DISASM "\t\t | Don't display disassembly for expensive lines\n\t" CMD_PARAM_VERBOSE "\t\t | Enable verbose logging\n\t" CMD_PARAM_ARGS_PASS_THROUGH " <Args>\t\t | Pass the remaining Arguments to the Application being profiled\n");
 
   wchar_t workingDirectory[MAX_PATH];
   FATAL_IF(0 == GetCurrentDirectory(ARRAYSIZE(workingDirectory), workingDirectory), "Failed to retrieve working directory. Aborting.");
@@ -310,6 +315,7 @@ int32_t main(void)
   bool indirectHits = false;
   bool favorAccuracy = false;
   bool noDisAsm = false;
+  size_t samplingDelay = 0;
 
   int32_t argsRemaining = argc - 2;
   int32_t argIndex = 2;
@@ -344,6 +350,13 @@ int32_t main(void)
       argsRemaining--;
       argIndex++;
     }
+    else if (wcscmp(pArgv[argIndex], _CMD_PARAM_SAMPLING_DELAY) == 0 && argsRemaining > 1)
+    {
+      samplingDelay = (size_t)max(_wtoi64(pArgv[argIndex + 1]), 0);
+
+      argsRemaining -= 2;
+      argIndex += 2;
+    }
     else if (wcscmp(pArgv[argIndex], _CMD_PARAM_NO_DISASM) == 0)
     {
       noDisAsm = true;
@@ -364,6 +377,8 @@ int32_t main(void)
 
       while (args[sizeof(_CMD_PARAM_ARGS_SPACE)] == '\0' || memcmp(args, _CMD_PARAM_ARGS_SPACE, sizeof(_CMD_PARAM_ARGS_SPACE) - sizeof(wchar_t)) != 0)
         args++;
+
+      args += ARRAYSIZE(_CMD_PARAM_ARGS) - 1;
 
       break;
     }
@@ -409,7 +424,7 @@ int32_t main(void)
     if (wcslen(args) == 0)
       printf("Attempting to launch '%ws'...\n", appPath);
     else
-      printf("Attempting to launch '%ws' with arguments '%ws'...\n", appPath, args);
+      printf("Attempting to launch '%ws' with arguments '%ws'...\n", appPath, args + 1);
     
     FATAL_IF(!CreateProcessW(appPath, args, NULL, NULL, FALSE, DEBUG_PROCESS | CREATE_NEW_CONSOLE, NULL, workingDirectory, &startupInfo, &processInfo), "Unable to start process. Aborting.");
   }
@@ -479,6 +494,7 @@ int32_t main(void)
     profileOptions.getStackTraceOnExtern = indirectHits;
     profileOptions.fastStackTrace = analyzeStackFast;
     profileOptions.favorPerformance = !favorAccuracy;
+    profileOptions.samplingDelay = samplingDelay;
 
     SProfileResult profileSession = ProfileApplicationNoStackTrace(appInfo, profileOptions);
 
@@ -492,7 +508,7 @@ int32_t main(void)
       constexpr size_t barHeight = 8;
 
       const size_t width = min(GetConsoleWidth() / barWidth, profileSession.indexAtSecond.size());
-      const size_t widthSkips = profileSession.indexAtSecond.size() / width;
+      const size_t widthSkips = (profileSession.indexAtSecond.size() + width - 1) / width;
 
       size_t maxHeight = 0;
       size_t lastIndex = 0;
@@ -521,8 +537,10 @@ int32_t main(void)
       constexpr size_t displayFactor = 4;
       const size_t heightDiv = maxHeight / barHeight;
 
-      const ConsoleColor colors[] = { CC_DarkGreen, CC_BrightGreen, CC_BrightYellow, CC_BrightYellow, CC_DarkYellow, CC_DarkYellow, CC_BrightRed, CC_DarkRed };
-      _STATIC_ASSERT(ARRAYSIZE(colors) == barHeight);
+      const ConsoleColor colors[] = { CC_DarkGreen, CC_BrightGreen, CC_BrightGreen, CC_BrightYellow, CC_BrightYellow, CC_DarkYellow, CC_DarkYellow, CC_BrightRed, CC_DarkRed };
+      _STATIC_ASSERT(ARRAYSIZE(colors) == barHeight + 1);
+
+      puts("");
 
       for (int64_t i = barHeight; i >= 0; i--)
       {
@@ -551,7 +569,7 @@ int32_t main(void)
 
       SetConsoleColor(CC_BrightGray, CC_Black);
 
-      for (const auto &_bar : bars)
+      for (size_t i = 0; i < bars.size(); i++)
         fputs("-----", stdout);
 
       puts("");
@@ -565,7 +583,7 @@ int32_t main(void)
 
       size_t second = 0;
 
-      if (1 == scanf("%" PRIu64 "", &second))
+      if (1 != scanf("%" PRIu64 "", &second))
         second = 0;
 
       if (second == 0)
@@ -575,7 +593,7 @@ int32_t main(void)
 
       puts("Select End Second: (0 to include everything)");
 
-      if (1 == scanf("%" PRIu64 "", &second))
+      if (1 != scanf("%" PRIu64 "", &second))
         second = 0;
 
       if (second == 0)
@@ -656,7 +674,7 @@ SProfileResult ProfileApplicationNoStackTrace(SAppInfo &appInfo, const SProfileO
   
   while (true)
   {
-    const bool hasDebugEvent = WaitForDebugEvent(&debugEvent, 0);
+    const bool hasDebugEvent = WaitForDebugEvent(&debugEvent, (DWORD)options.samplingDelay);
 
     if (hasDebugEvent)
     {
@@ -929,6 +947,8 @@ void UpdateAppInfo(SAppInfo &appInfo, const DEBUG_EVENT &evnt)
   {
     wchar_t filename[MAX_PATH];
 
+    SetConsoleColor(CC_DarkGray, CC_Black);
+
     if (GetModuleFileName((HMODULE)evnt.u.LoadDll.lpBaseOfDll, filename, ARRAYSIZE(filename)))
     {
       if (_VerboseLogging)
@@ -960,6 +980,8 @@ void UpdateAppInfo(SAppInfo &appInfo, const DEBUG_EVENT &evnt)
         printf("Unloaded Unknown Module at 0x%" PRIX64 ".\n", (size_t)evnt.u.LoadDll.lpBaseOfDll);
     }
 
+    SetConsoleColor(CC_BrightGray, CC_Black);
+
     break;
   }
   }
@@ -970,6 +992,8 @@ void UpdateAppInfo(SAppInfo &appInfo, const DEBUG_EVENT &evnt)
 SEvalResult EvaluateSession(SAppInfo &appInfo, _Inout_ SProfileResult &perfSession, const size_t startIndex, const size_t endIndex)
 {
   SEvalResult ret;
+
+  printf("Evaluating %" PRIu64 " selected samples...\n", endIndex - startIndex);
 
   std::sort(perfSession.directHits.begin() + startIndex, perfSession.directHits.begin() + endIndex);
 
@@ -1015,7 +1039,7 @@ SEvalResult EvaluateSession(SAppInfo &appInfo, _Inout_ SProfileResult &perfSessi
       SPerfEval func;
       func.symbolStartPos = virtualAddress;
       func.symbolEndPos = func.symbolStartPos + length;
-      func.moduleIndex = hit.GetModule();
+      func.moduleIndex = (uint8_t)hit.GetModule();
 
       CopyString(func.symbolName, sizeof(func.symbolName), appInfo.modules[func.moduleIndex].moduleName);
       StrCatBuffW(func.symbolName, L" - ", sizeof(func.symbolName));
@@ -1310,7 +1334,7 @@ bool InstrumentFunctionWithSource(SAppInfo &appInfo, const SEvalResult &evaluati
 
     const size_t expensiveThreshold = (size_t)(maximumLineHits * options.expensiveLineThreshold);
     const size_t relevantThreshold = (size_t)(maximumLineHits * options.relevantLineThreshold);
-    const size_t disasmThreshold = (size_t)(maximumLineHits * options.disasmLineThreshold);
+    const size_t disasmThreshold = max((size_t)(maximumLineHits * options.disasmLineThreshold), options.minAsmSamples);
 
     bool failedFileDisasmShown = false;
 
