@@ -429,6 +429,13 @@ int32_t main(void)
   FATAL_IF(analyzeStack && indirectHits, "Option '" CMD_PARAM_INDIRECT_HITS "' cannot be used in conjunction with option '" CMD_PARAM_STACK_TRACE "'.");
   FATAL_IF(analyzeStackFast && !(analyzeStack || indirectHits), "Option '" CMD_PARAM_FAST_STACK_TRACE "' can only be used with '" CMD_PARAM_INDIRECT_HITS "' or '" CMD_PARAM_STACK_TRACE "'.");
 
+  // Does the file even exist?
+  {
+    const DWORD attributes = GetFileAttributesW(appPath);
+
+    FATAL_IF(attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0, "The target application ('%ws') does not exist. Aborting.", appPath);
+  }
+
   SAppInfo appInfo;
   appInfo.modules.emplace_back();
   CopyString(appInfo.modules[0].filename, sizeof(appInfo.modules[0].filename), appPath);
@@ -438,16 +445,33 @@ int32_t main(void)
   // Attempt to read PDB.
   {
     CComPtr<IDiaDataSource> pdbSource;
+    HRESULT hr;
 
-    FATAL_IF(FAILED(CoInitialize(nullptr)), "Failed to Initialize. Aborting.");
+    FATAL_IF(FAILED(hr = CoInitialize(nullptr)), "Failed to Initialize. Aborting.");
 
-    FATAL_IF(FAILED(CoCreateInstance(CLSID_DiaSource, nullptr, CLSCTX_INPROC_SERVER, __uuidof(IDiaDataSource), (void **)&pdbSource)), "Failed to retrieve an instance of the PDB Parser.");
+    if (FAILED(hr = CoCreateInstance(CLSID_DiaSource, nullptr, CLSCTX_INPROC_SERVER, __uuidof(IDiaDataSource), (void **)&pdbSource)) || pdbSource == nullptr)
+    {
+      // See https://github.com/baldurk/renderdoc/blob/c3ca732ab9d49d710922ce0243e7bd7b404415d1/renderdoc/os/win32/win32_callstack.cpp
+
+      wchar_t *dllPath = L"msdia140.dll";
+      HMODULE msdia140dll = LoadLibraryW(dllPath);
+      FATAL_IF(msdia140dll == nullptr, "Failed to load '%ws'. Aborting.", dllPath);
+
+      typedef decltype(&DllGetClassObject) DllGetClassObjectFunc;
+      DllGetClassObjectFunc pDllGetClassObject = reinterpret_cast<DllGetClassObjectFunc>(GetProcAddress(msdia140dll, "DllGetClassObject"));
+      FATAL_IF(pDllGetClassObject == nullptr, "Failed to load symbol from '%ws'. Aborting.", dllPath);
+
+      CComPtr<IClassFactory> classFactory;
+      FATAL_IF(FAILED(hr = pDllGetClassObject(__uuidof(DiaSource), IID_IClassFactory, reinterpret_cast<void **>(&classFactory))) || classFactory == nullptr, "Failed to retrieve COM Class Factory. Aborting.");
+      
+      FATAL_IF(FAILED(hr = classFactory->CreateInstance(nullptr, __uuidof(IDiaDataSource), reinterpret_cast<void **>(&pdbSource))) || pdbSource == nullptr, "Failed to create debug source from class factory. Aborting.");
+    }
 
     if (pdbPath == nullptr || FAILED(pdbSource->loadDataFromPdb(pdbPath)))
-      if (FAILED(pdbSource->loadDataForExe(appPath, nullptr, nullptr)))
+      if (FAILED(hr = pdbSource->loadDataForExe(appPath, nullptr, nullptr)))
         FATAL("Failed to find pdb for the specified path.");
 
-    FATAL_IF(FAILED(pdbSource->openSession(&appInfo.modules[0].pdbSession)), "Failed to Open Session.");
+    FATAL_IF(FAILED(hr = pdbSource->openSession(&appInfo.modules[0].pdbSession)), "Failed to Open Session.");
   }
 
   PROCESS_INFORMATION processInfo;
