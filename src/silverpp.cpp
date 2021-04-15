@@ -151,6 +151,7 @@ struct SNamedLibraryInfo
   size_t moduleEndAddress;
   size_t startAddress;
   size_t endAddress;
+  bool loaded;
 
   std::vector<SLibraryFunction> functions;
 };
@@ -1049,6 +1050,9 @@ SProfileResult ProfileApplicationNoStackTrace(SAppInfo &appInfo, const SProfileO
                   {
                     ++foreignModuleIndex;
 
+                    if (!_module.loaded)
+                      continue;
+
                     const size_t stackRelativeAddress = stackFrame.AddrPC.Offset - _module.moduleBaseAddress;
 
                     if (stackRelativeAddress < _module.endAddress && stackRelativeAddress >= _module.startAddress)
@@ -1211,6 +1215,7 @@ void UpdateAppInfo(SAppInfo &appInfo, const DEBUG_EVENT &evnt)
           info.startAddress = ntHeader.OptionalHeader.BaseOfCode;
           info.endAddress = info.startAddress + (size_t)ntHeader.OptionalHeader.SizeOfCode;
           info.moduleEndAddress = info.moduleBaseAddress + info.endAddress;
+          info.loaded = true;
 
           const IMAGE_EXPORT_DIRECTORY *pExports = reinterpret_cast<const IMAGE_EXPORT_DIRECTORY *>(info.moduleBaseAddress + ntHeader.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
           IMAGE_EXPORT_DIRECTORY exports;
@@ -1304,8 +1309,15 @@ void UpdateAppInfo(SAppInfo &appInfo, const DEBUG_EVENT &evnt)
           break;
         }
 
-        if (!found)
+        if (!found && _VerboseLogging)
           puts(" (Skipped)");
+      }
+
+      if (!found)
+      {
+        for (auto &_module : appInfo.foreignModules)
+          if (_module.loaded && _module.moduleBaseAddress == (size_t)evnt.u.UnloadDll.lpBaseOfDll)
+            _module.loaded = false;
       }
     }
     else
@@ -1377,6 +1389,8 @@ SEvalResult EvaluateSession(SAppInfo &appInfo, _Inout_ SProfileResult &perfSessi
       func.symbolStartPos = virtualAddress;
       func.symbolEndPos = func.symbolStartPos + length;
 
+      // TODO: Explore Symbol Bounds. (Since we don't get the full range the PDB claims are this particular symbol for some reason...)
+
       if (hit.GetAddress() < func.symbolStartPos)
         func.symbolStartPos = hit.GetAddress();
 
@@ -1440,26 +1454,27 @@ SEvalResult EvaluateSession(SAppInfo &appInfo, _Inout_ SProfileResult &perfSessi
       if (hit.GetForeignModule() != (uint8_t)foreignModuleIndex)
         break;
 
-      bool found = false;
+      size_t lastOffset = (size_t)-1;
       
-      for (; functionIndex < appInfo.foreignModules[hit.GetForeignModule()].functions.size(); functionIndex++)
+      for (; functionIndex < appInfo.foreignModules[foreignModuleIndex].functions.size(); functionIndex++)
       {
-        const auto &function = appInfo.foreignModules[hit.GetForeignModule()].functions[functionIndex];
+        const auto &function = appInfo.foreignModules[foreignModuleIndex].functions[functionIndex];
 
         if (function.virtualAddressOffset < hit.GetAddress())
-        {
-          const size_t offset = hit.GetAddress() - function.virtualAddressOffset;
-
-          hit.ToFunctionOffset(offset, functionIndex);
-
-          found = true;
-
+          lastOffset = hit.GetAddress() - function.virtualAddressOffset;
+        else
           break;
-        }
       }
 
-      if (!found)
+      if (lastOffset == (size_t)-1)
+      {
         hit.ToFunctionOffset(hit.GetAddress(), 0xFFFF);
+      }
+      else
+      {
+        functionIndex--;
+        hit.ToFunctionOffset(lastOffset, functionIndex);
+      }
     }
   }
 
@@ -1474,7 +1489,7 @@ SEvalResult EvaluateSession(SAppInfo &appInfo, _Inout_ SProfileResult &perfSessi
     {
       const SProfileIndirectHit &hit = perfSession.indirectHits[i];
 
-      while (funcEvalIndex < ret.eval.size() && (ret.eval[funcEvalIndex].moduleIndex < hit.ownedModuleHit.GetModule() || hit.ownedModuleHit.GetAddress() < ret.eval[funcEvalIndex].symbolStartPos || hit.ownedModuleHit.GetAddress() > ret.eval[funcEvalIndex].symbolEndPos))
+      while (funcEvalIndex < ret.eval.size() && (ret.eval[funcEvalIndex].moduleIndex < hit.ownedModuleHit.GetModule() || hit.ownedModuleHit.GetAddress() < ret.eval[funcEvalIndex].symbolStartPos || hit.ownedModuleHit.GetAddress() >= ret.eval[funcEvalIndex].symbolEndPos))
         funcEvalIndex++;
 
       if (funcEvalIndex >= ret.eval.size())
@@ -1496,7 +1511,7 @@ SEvalResult EvaluateSession(SAppInfo &appInfo, _Inout_ SProfileResult &perfSessi
     const SProfileIndirectHit &hit = perfSession.indirectHits[i];
     auto &func = ret.eval[funcEvalIndex];
 
-    if (hit.ownedModuleHit.GetAddress() < func.symbolEndPos)
+    if (hit.ownedModuleHit.GetAddress() <= func.symbolEndPos)
     {
       bool found = false;
 
@@ -1675,7 +1690,7 @@ size_t DisplayOffsetIndirectHits(SAppInfo &appInfo, const SPerfEval &function, c
     const auto &foreignHit = function.foreignHits[i];
     const size_t foreignHitAddress = function.symbolStartPos + foreignHit.offset;
 
-    if (foreignHitAddress > endOffset)
+    if (foreignHitAddress > endOffset) // Yes, this is technically off by one, however this appears to be correct.
     {
       return i;
     }
@@ -1683,7 +1698,7 @@ size_t DisplayOffsetIndirectHits(SAppInfo &appInfo, const SPerfEval &function, c
     {
       SetConsoleColor(CC_BrightGreen, CC_Black);
 
-      printf("           | % 5" PRIu64 " | >> INDIRECT CALL AT %ws - ", foreignHit.count, appInfo.foreignModules[foreignHit.foreignModuleIndex].filename + appInfo.foreignModules[foreignHit.foreignModuleIndex].nameOffset);
+      printf("           | % 5" PRIu64 " | INDIRECT CALL AT %ws - ", foreignHit.count, appInfo.foreignModules[foreignHit.foreignModuleIndex].filename + appInfo.foreignModules[foreignHit.foreignModuleIndex].nameOffset);
 
       if (foreignHit.functionIndex == 0xFFFF)
         printf("<UNKNOWN_FUNCTION>\n");
@@ -1784,7 +1799,7 @@ bool InstrumentDisassembly(SAppInfo &appInfo, const SPerfEval &function, const s
 
     while (hitIndex < function.hitsOffset.size())
     {
-      if (function.hitsOffset[hitIndex] > virtualAddressOffset + instruction.length)
+      if (function.hitsOffset[hitIndex] > virtualAddressOffset + instruction.length) // Yes, this is technically off by one, however this appears to be correct.
         break;
       else if (function.hitsOffset[hitIndex] >= virtualAddressOffset)
         hits++;
@@ -1887,29 +1902,27 @@ bool InstrumentDisassembly(SAppInfo &appInfo, const SPerfEval &function, const s
             if (mappedAddress >= _module.moduleBaseAddress && mappedAddress < _module.moduleEndAddress)
             {
               printf("\t\t\t\t[%ws - ", _module.filename + _module.nameOffset);
+              size_t lastFunctionIndex = (size_t)-1;
+              size_t lastOffset = (size_t)-1;
 
               for (const auto &_symbol : _module.functions)
               {
                 const size_t mappedStartAddress = _symbol.virtualAddressOffset + _module.moduleBaseAddress;
 
-                if (_symbol.virtualAddressOffset < mappedStartAddress)
-                {
-                  const size_t dist = mappedAddress - mappedStartAddress;
-
-                  printf(_symbol.name);
-
-                  if (dist != 0)
-                    printf(" +%" PRIu64 "", dist);
-
-                  printf("]");
-
-                  found = true;
+                if (_symbol.virtualAddressOffset <= mappedStartAddress)
+                  lastOffset = mappedAddress - mappedStartAddress;
+                else
                   break;
-                }
+
+                lastFunctionIndex++;
               }
 
-              if (!found)
+              if (lastOffset == (size_t)-1)
                 printf("<UNKNOWN_FUNCTION>]");
+              else if (lastOffset == 0)
+                printf("%s]", _module.functions[lastFunctionIndex].name);
+              else
+                printf("%s +%" PRIu64 "]", _module.functions[lastFunctionIndex].name, lastOffset);
 
               break;
             }
