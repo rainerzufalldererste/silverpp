@@ -635,7 +635,13 @@ int32_t main(void)
 
     FATAL_IF(!WaitForDebugEvent(&debugEvent, 1000), "Failed to debug process. Aborting.");
     UpdateAppInfo(appInfo, debugEvent);
-    FATAL_IF(!ContinueDebugEvent(debugEvent.dwProcessId, debugEvent.dwThreadId, DBG_CONTINUE), "Failed to continue debugged process. Aborting.");
+
+    DWORD continueStatus = DBG_CONTINUE;
+
+    if (debugEvent.dwDebugEventCode == EXCEPTION_DEBUG_EVENT)
+      continueStatus = DBG_EXCEPTION_NOT_HANDLED;
+
+    FATAL_IF(!ContinueDebugEvent(debugEvent.dwProcessId, debugEvent.dwThreadId, continueStatus), "Failed to continue debugged process. Aborting.");
   }
 
   // Get Base Address of Main Module.
@@ -649,7 +655,13 @@ int32_t main(void)
       while (WaitForDebugEvent(&debugEvent, 0))
       {
         UpdateAppInfo(appInfo, debugEvent);
-        FATAL_IF(!ContinueDebugEvent(debugEvent.dwProcessId, debugEvent.dwThreadId, DBG_CONTINUE), "Failed to continue debugged process. Aborting.");
+
+        DWORD continueStatus = DBG_CONTINUE;
+
+        if (debugEvent.dwDebugEventCode == EXCEPTION_DEBUG_EVENT)
+          continueStatus = DBG_EXCEPTION_NOT_HANDLED;
+
+        FATAL_IF(!ContinueDebugEvent(debugEvent.dwProcessId, debugEvent.dwThreadId, continueStatus), "Failed to continue debugged process. Aborting.");
       }
     }
 
@@ -682,7 +694,12 @@ int32_t main(void)
       appInfo.threads.emplace_back(mainThread);
     }
 
-    FATAL_IF(!ContinueDebugEvent(debugEvent.dwProcessId, debugEvent.dwThreadId, DBG_CONTINUE), "Failed to continue debugged process. Aborting.");
+    DWORD continueStatus = DBG_CONTINUE;
+
+    if (debugEvent.dwDebugEventCode == EXCEPTION_DEBUG_EVENT)
+      continueStatus = DBG_EXCEPTION_NOT_HANDLED;
+
+    FATAL_IF(!ContinueDebugEvent(debugEvent.dwProcessId, debugEvent.dwThreadId, continueStatus), "Failed to continue debugged process. Aborting.");
   }
 
   if (!analyzeStack)
@@ -1108,7 +1125,12 @@ SProfileResult ProfileApplicationNoStackTrace(SAppInfo &appInfo, const SProfileO
 
     if (hasDebugEvent)
     {
-      if (!ContinueDebugEvent(debugEvent.dwProcessId, debugEvent.dwThreadId, DBG_CONTINUE))
+      DWORD continueStatus = DBG_CONTINUE;
+
+      if (debugEvent.dwDebugEventCode == EXCEPTION_DEBUG_EVENT)
+        continueStatus = DBG_EXCEPTION_NOT_HANDLED;
+
+      if (!ContinueDebugEvent(debugEvent.dwProcessId, debugEvent.dwThreadId, continueStatus))
       {
         puts("Failed to Continue Application. Stopping the Profiler.");
         break;
@@ -1162,6 +1184,7 @@ void UpdateAppInfo(SAppInfo &appInfo, const DEBUG_EVENT &evnt)
   case LOAD_DLL_DEBUG_EVENT:
   {
     wchar_t filename[MAX_PATH];
+    bool hasFilename = false;
 
     SetConsoleColor(CC_DarkGray, CC_Black);
 
@@ -1170,9 +1193,57 @@ void UpdateAppInfo(SAppInfo &appInfo, const DEBUG_EVENT &evnt)
       if (_VerboseLogging)
         printf("Loaded DLL '%ws'.", filename);
 
+      hasFilename = true;
+    }
+    else
+    {
+      char filenameA[MAX_PATH];
+      size_t bytesRead = 0;
+
+      if (evnt.u.LoadDll.lpImageName != nullptr)
+      {
+        void *pName = nullptr;
+
+        if (ReadProcessMemory(appInfo.processHandle, evnt.u.LoadDll.lpImageName, &pName, sizeof(pName), &bytesRead) && bytesRead == sizeof(pName))
+        {
+          if (evnt.u.LoadDll.fUnicode)
+          {
+            if (ReadProcessMemory(appInfo.processHandle, pName, filename, sizeof(filename), &bytesRead))
+              hasFilename = true;
+
+            filename[ARRAYSIZE(filename) - 1] = L'\0';
+          }
+          else
+          {
+            if (ReadProcessMemory(appInfo.processHandle, pName, filenameA, sizeof(filenameA), &bytesRead))
+            {
+              filenameA[sizeof(filenameA) - 1] = '\0';
+
+              if (0 < MultiByteToWideChar(CP_UTF8, 0, filenameA, sizeof(filenameA), filename, ARRAYSIZE(filename)))
+                hasFilename = true;
+            }
+
+            filename[ARRAYSIZE(filename) - 1] = L'\0';
+          }
+        }
+      }
+
+      if (_VerboseLogging)
+      {
+        if (hasFilename)
+          printf("Loaded Module '%ws' at 0x%" PRIX64 ".", filename, (size_t)evnt.u.LoadDll.lpBaseOfDll);
+        else
+          printf("Loaded Unknown Module at 0x%" PRIX64 ".", (size_t)evnt.u.LoadDll.lpBaseOfDll);
+      }
+
+      if (!hasFilename)
+        wnsprintfW(filename, ARRAYSIZE(filename), L"Unknown Module at 0x%" PRIX64, (size_t)evnt.u.LoadDll.lpBaseOfDll);
+    }
+
+    {
       bool loaded = false;
 
-      if (evnt.u.LoadDll.nDebugInfoSize != 0 && evnt.u.LoadDll.dwDebugInfoFileOffset != 0)
+      if (hasFilename && evnt.u.LoadDll.nDebugInfoSize != 0 && evnt.u.LoadDll.dwDebugInfoFileOffset != 0)
       {
         IMAGE_DOS_HEADER moduleHeader;
         IMAGE_NT_HEADERS ntHeader;
@@ -1275,7 +1346,13 @@ void UpdateAppInfo(SAppInfo &appInfo, const DEBUG_EVENT &evnt)
               functionName[sizeof(functionName) - 1] = '\0';
 
               SLibraryFunction function;
-              CopyString(function.name, sizeof(function.name), functionName);
+              char functionNameUndecorated[1024];
+
+              if (UnDecorateSymbolName(functionName, functionNameUndecorated, sizeof(functionNameUndecorated), UNDNAME_NO_ACCESS_SPECIFIERS | UNDNAME_NO_ALLOCATION_MODEL))
+                CopyString(function.name, sizeof(function.name), functionNameUndecorated);
+              else
+                CopyString(function.name, sizeof(function.name), functionName);
+
               function.virtualAddressOffset = (size_t)functionAddressOffset;
 
               info.functions.emplace_back(function);
@@ -1296,11 +1373,6 @@ void UpdateAppInfo(SAppInfo &appInfo, const DEBUG_EVENT &evnt)
           }
         }
       }
-    }
-    else
-    {
-      if (_VerboseLogging)
-        printf("Skipping Unknown Module at 0x%" PRIX64 ".\n", (size_t)evnt.u.LoadDll.lpBaseOfDll);
     }
 
     SetConsoleColor(CC_BrightGray, CC_Black);
@@ -1513,7 +1585,7 @@ SEvalResult EvaluateSession(SAppInfo &appInfo, _Inout_ SProfileResult &perfSessi
     {
       const SProfileIndirectHit &hit = perfSession.indirectHits[i];
 
-      while (funcEvalIndex < ret.eval.size() && (ret.eval[funcEvalIndex].moduleIndex < hit.ownedModuleHit.GetModule() || hit.ownedModuleHit.GetAddress() < ret.eval[funcEvalIndex].symbolStartPos || hit.ownedModuleHit.GetAddress() >= ret.eval[funcEvalIndex].symbolEndPos))
+      while (funcEvalIndex < ret.eval.size() && (ret.eval[funcEvalIndex].moduleIndex < hit.ownedModuleHit.GetModule() || hit.ownedModuleHit.GetAddress() < ret.eval[funcEvalIndex].symbolStartPos))
         funcEvalIndex++;
 
       if (funcEvalIndex >= ret.eval.size())
@@ -1533,36 +1605,45 @@ SEvalResult EvaluateSession(SAppInfo &appInfo, _Inout_ SProfileResult &perfSessi
 
     // Now ret.eval[funcEvalIndex].moduleIndex matches the hit moduleIndex.
     const SProfileIndirectHit &hit = perfSession.indirectHits[i];
-    auto &func = ret.eval[funcEvalIndex];
-
-    if (hit.ownedModuleHit.GetAddress() <= func.symbolEndPos)
+    
+    do
     {
-      bool found = false;
+      auto &func = ret.eval[funcEvalIndex];
 
-      // Does the indirectly hit function already contain a reference to this library function?
-      for (auto &_indirectHit : func.foreignHits)
+      if (hit.ownedModuleHit.GetAddress() <= func.symbolEndPos)
       {
-        // Yes? Then increment the count.
-        if (_indirectHit.foreignModuleIndex == hit.GetForeignModule() && _indirectHit.functionIndex == hit.GetFunctionIndex() && _indirectHit.offset == hit.ownedModuleHit.GetAddress() - func.symbolStartPos)
+        bool found = false;
+
+        // Does the indirectly hit function already contain a reference to this library function?
+        for (auto &_indirectHit : func.foreignHits)
         {
-          _indirectHit.count++;
-          found = true;
-          break;
+          // Yes? Then increment the count.
+          if (_indirectHit.foreignModuleIndex == hit.GetForeignModule() && _indirectHit.functionIndex == hit.GetFunctionIndex() && _indirectHit.offset == hit.ownedModuleHit.GetAddress() - func.symbolStartPos)
+          {
+            _indirectHit.count++;
+            found = true;
+            break;
+          }
         }
+
+        // No? Then add one!
+        if (!found)
+        {
+          SForeignHitEval fhit;
+          fhit.offset = (uint32_t)(hit.ownedModuleHit.GetAddress() - func.symbolStartPos);
+          fhit.count = 1;
+          fhit.foreignModuleIndex = (uint8_t)(hit.GetForeignModule());
+          fhit.functionIndex = (uint16_t)hit.GetFunctionIndex();
+
+          func.foreignHits.emplace_back(fhit);
+        }
+
+        break;
       }
 
-      // No? Then add one!
-      if (!found)
-      {
-        SForeignHitEval fhit;
-        fhit.offset = (uint32_t)(hit.ownedModuleHit.GetAddress() - func.symbolStartPos);
-        fhit.count = 1;
-        fhit.foreignModuleIndex = (uint8_t)(hit.GetForeignModule());
-        fhit.functionIndex = (uint16_t)hit.GetFunctionIndex();
+      funcEvalIndex++;
 
-        func.foreignHits.emplace_back(fhit);
-      }
-    }
+    } while (funcEvalIndex < ret.eval.size());
   }
 
   for (auto &_func : ret.eval)
@@ -1784,9 +1865,6 @@ uint64_t _GetAddressFromOperand(const ZydisDecodedInstruction *pInstruction, con
 
 bool InstrumentDisassembly(SAppInfo &appInfo, const SPerfEval &function, const size_t startAddress, const size_t endAddress, const SFuncLineOptions &options, const size_t maxLineHits, size_t *pIndirectHitsStartIndex)
 {
-  if (startAddress == endAddress)
-    return true;
-
   size_t virtualAddress = startAddress;
   ZydisDecodedInstruction instruction;
   char disasmBuffer[1024] = {};
@@ -1815,7 +1893,7 @@ bool InstrumentDisassembly(SAppInfo &appInfo, const SPerfEval &function, const s
 
   while (virtualAddress < endAddress)
   {
-    ERROR_RETURN_IF(!(ZYAN_SUCCESS(ZydisDecoderDecodeBuffer(&appInfo.modules[function.moduleIndex].decoder, pBinaryAtAddress, endAddress - virtualAddress, &instruction))), "Invalid Instruction at 0x%" PRIX64 ".", virtualAddress);
+    ERROR_RETURN_IF(!(ZYAN_SUCCESS(ZydisDecoderDecodeBuffer(&appInfo.modules[function.moduleIndex].decoder, pBinaryAtAddress, endAddress - virtualAddress + 32 /* Just to force decoding the last instruction */, &instruction))), "Invalid Instruction at 0x%" PRIX64 ".", virtualAddress);
     ERROR_RETURN_IF(!ZYAN_SUCCESS(ZydisFormatterFormatInstruction(&appInfo.modules[function.moduleIndex].formatter, &instruction, disasmBuffer, sizeof(disasmBuffer), virtualAddress)), "Failed to Format Instruction at 0x%" PRIX64 ".", virtualAddress);
 
     size_t hits = 0;
@@ -1998,7 +2076,10 @@ bool InstrumentFunctionDisassembly(SAppInfo &appInfo, const SPerfEval &function,
   maxHit = max(maxHit, currentHits);
   size_t indirectHitStartIndex = 0;
 
-  const bool result = InstrumentDisassembly(appInfo, function, function.symbolStartPos, function.symbolEndPos, options, maxHit, &indirectHitStartIndex);
+  const size_t startAddress = function.symbolStartPos + (function.hitsOffset.size() ? function.hitsOffset[0] : 0);
+  const size_t endAddress = (function.hitsOffset.size() ? min(function.symbolStartPos + function.hitsOffset[function.hitsOffset.size() - 1] + 16, function.symbolEndPos) : function.symbolEndPos) + 1; // just to even decode single instructions.
+
+  const bool result = InstrumentDisassembly(appInfo, function, startAddress, endAddress, options, maxHit, &indirectHitStartIndex);
   
   SetConsoleColor(CC_BrightGray, CC_Black);
 
@@ -2057,7 +2138,7 @@ bool InstrumentFunctionWithSource(SAppInfo &appInfo, const SEvalResult &evaluati
           failedFileDisasmShown = true;
         }
 
-        while (lineEval.lines.size() > 1 && lineEval.lines[i + 1].fileIndex == fileIndex)
+        while (lineEval.lines.size() > i + 1 && lineEval.lines[i + 1].fileIndex == fileIndex)
           i++;
 
         continue;
