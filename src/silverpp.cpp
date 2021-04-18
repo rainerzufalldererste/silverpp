@@ -937,15 +937,18 @@ SProfileResult ProfileApplicationNoStackTrace(SAppInfo &appInfo, const SProfileO
         {
           bool external = true;
 
-          for (const auto &_module : appInfo.modules)
+          if (threadContext.Rip >= appInfo.minimalVirtualAddress && threadContext.Rip < appInfo.maximalVirtualAddress)
           {
-            const size_t relativeAddress = threadContext.Rip - _module.moduleBaseAddress;
-
-            if (relativeAddress < _module.endAddress && relativeAddress >= _module.startAddress)
+            for (const auto &_module : appInfo.modules)
             {
-              ret.directHits.emplace_back(relativeAddress, (uint8_t)_module.moduleIndex);
-              external = false;
-              break;
+              const size_t relativeAddress = threadContext.Rip - _module.moduleBaseAddress;
+
+              if (relativeAddress < _module.endAddress && relativeAddress >= _module.startAddress)
+              {
+                ret.directHits.emplace_back(relativeAddress, (uint8_t)_module.moduleIndex);
+                external = false;
+                break;
+              }
             }
           }
           
@@ -1015,6 +1018,28 @@ SProfileResult ProfileApplicationNoStackTrace(SAppInfo &appInfo, const SProfileO
               bool hasIndirectHit = false;
               SProfileIndirectHit indirectHit;
 
+              if (threadContext.Rip >= appInfo.minimalIndirectVirtualAddress && threadContext.Rip < appInfo.maximalIndirectVirtualAddress)
+              {
+                size_t foreignModuleIndex = (size_t)-1;
+
+                for (const auto &_module : appInfo.foreignModules)
+                {
+                  ++foreignModuleIndex;
+
+                  if (!_module.loaded)
+                    continue;
+
+                  const size_t stackRelativeAddress = stackFrame.AddrPC.Offset - _module.moduleBaseAddress;
+
+                  if (stackRelativeAddress < _module.endAddress && stackRelativeAddress >= _module.startAddress)
+                  {
+                    indirectHit.SetIndirectPart(stackRelativeAddress, (uint8_t)foreignModuleIndex);
+                    hasIndirectHit = true;
+                    break;
+                  }
+                }
+              }
+
               while (StackWalk64(IMAGE_FILE_MACHINE_AMD64, appInfo.processHandle, _thread.handle, &stackFrame, &threadContext, NULL, SymFunctionTableAccess64, SymGetModuleBase64, NULL))
               {
                 if (stackFrame.AddrPC.Segment == 0 && stackFrame.AddrPC.Offset >= appInfo.minimalVirtualAddress && stackFrame.AddrPC.Offset < appInfo.maximalVirtualAddress)
@@ -1042,7 +1067,8 @@ SProfileResult ProfileApplicationNoStackTrace(SAppInfo &appInfo, const SProfileO
                   if (found)
                     break;
                 }
-                else if (stackFrame.AddrPC.Segment == 0 && stackFrame.AddrPC.Offset >= appInfo.minimalIndirectVirtualAddress && stackFrame.AddrPC.Offset < appInfo.maximalIndirectVirtualAddress)
+                
+                if (stackFrame.AddrPC.Segment == 0 && stackFrame.AddrPC.Offset >= appInfo.minimalIndirectVirtualAddress && stackFrame.AddrPC.Offset < appInfo.maximalIndirectVirtualAddress)
                 {
                   size_t foreignModuleIndex = (size_t)-1;
 
@@ -1388,8 +1414,6 @@ SEvalResult EvaluateSession(SAppInfo &appInfo, _Inout_ SProfileResult &perfSessi
       SPerfEval func;
       func.symbolStartPos = virtualAddress;
       func.symbolEndPos = func.symbolStartPos + length;
-
-      // TODO: Explore Symbol Bounds. (Since we don't get the full range the PDB claims are this particular symbol for some reason...)
 
       if (hit.GetAddress() < func.symbolStartPos)
         func.symbolStartPos = hit.GetAddress();
