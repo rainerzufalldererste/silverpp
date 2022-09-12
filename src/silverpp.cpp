@@ -310,6 +310,7 @@ struct SProcessInfo
 struct SAppInfo
 {
   std::vector<SProcessInfo> procs;
+  size_t runningProcesses = 0;
 };
 
 struct SLineEval
@@ -755,6 +756,13 @@ int32_t main(void)
       FATAL_IF(profileSessionIndex > profileSession.procs.size(), "Invalid Profile Session Selected. Aborting.");
     }
 
+    size_t totalSamples = 0;
+
+    for (size_t i = 0; i < profileSession.procs.size(); i++)
+      totalSamples += profileSession.procs[i].directHits.size() + profileSession.procs[i].indirectHits.size();
+
+    FATAL_IF(totalSamples == 0, "No Samples captured.");
+
     size_t startIndex = 0;
     size_t indirectStartIndex = 0;
     size_t endIndex = 0;
@@ -965,7 +973,7 @@ bool GetPdbSource(_Out_ IDiaDataSource **ppPdbSource, const wchar_t *pdbPath, co
   {
     if (FAILED(hr = (*ppPdbSource)->loadDataForExe(appPath, nullptr, nullptr)))
     {
-      puts("Failed to find pdb for the specified path.");
+      printf("Failed to find pdb for '%ws'.\n", appPath);
       return false;
     }
   }
@@ -1001,7 +1009,35 @@ SProfileResult ProfileApplicationNoStackTrace(SAppInfo &appInfo, const SProfileO
       case EXIT_PROCESS_DEBUG_EVENT:
       {
         ContinueDebugEvent(debugEvent.dwProcessId, debugEvent.dwThreadId, DBG_CONTINUE);
-        return ret;
+
+        appInfo.runningProcesses--;
+
+        char filename[MAX_PATH];
+        bool hasName = (0 != GetModuleFileNameExA(debugEvent.u.CreateProcessInfo.hProcess, nullptr, filename, ARRAYSIZE(filename)));
+        
+        if (!hasName)
+        {
+          for (size_t processIndex = 0; processIndex < appInfo.procs.size(); processIndex++)
+          {
+            if (appInfo.procs[processIndex].processId == debugEvent.dwProcessId)
+            {
+              if (!!(hasName = appInfo.procs[processIndex].hasName))
+                CopyString(filename, ARRAYSIZE(filename), appInfo.procs[processIndex].name);
+
+              break;
+            }
+          }
+        }
+
+        if (hasName)
+          printf("Process exited. (ProcessId %" PRIu32 ", '%s')\n", debugEvent.dwProcessId, filename);
+        else
+          printf("Process exited. (ProcessId %" PRIu32 ")\n", debugEvent.dwProcessId);
+
+        if (appInfo.runningProcesses == 0)
+          goto after_loop;
+
+        break;
       }
 
       default:
@@ -1014,14 +1050,12 @@ SProfileResult ProfileApplicationNoStackTrace(SAppInfo &appInfo, const SProfileO
 
     const size_t ticks = GetTickCount64();
 
-    size_t processIndex = 0;
-
-    for (; processIndex < appInfo.procs.size(); processIndex++)
-      if (appInfo.procs[processIndex].processId == debugEvent.dwProcessId)
-        break;
-
-    if (processIndex < appInfo.procs.size())
+    for (size_t processIndex = 0; processIndex < appInfo.procs.size(); processIndex++)
     {
+      if (hasDebugEvent)
+        if (appInfo.procs[processIndex].processId != debugEvent.dwProcessId)
+          continue;
+
       while (processIndex >= ret.procs.size())
       {
         SProcessProfileResult profileResult;
@@ -1232,8 +1266,8 @@ SProfileResult ProfileApplicationNoStackTrace(SAppInfo &appInfo, const SProfileO
 
       if (!ContinueDebugEvent(debugEvent.dwProcessId, debugEvent.dwThreadId, continueStatus))
       {
-        puts("Failed to Continue Application. Stopping the Profiler.");
-        break;
+        puts("Failed to continue Application.");
+        continue;
       }
     }
     else
@@ -1241,6 +1275,8 @@ SProfileResult ProfileApplicationNoStackTrace(SAppInfo &appInfo, const SProfileO
       YieldProcessor();
     }
   }
+
+after_loop:
 
   for (size_t i = 0; i < ret.procs.size(); i++)
     ret.procs[i].directHitIndexAtSecond.push_back(ret.procs[i].directHits.size());
@@ -1277,6 +1313,8 @@ void UpdateAppInfo(SAppInfo &appInfo, const DEBUG_EVENT &evnt)
 
   case CREATE_PROCESS_DEBUG_EVENT:
   {
+    appInfo.runningProcesses++;
+
     size_t processIndex = 0;
 
     for (; processIndex < appInfo.procs.size(); processIndex++)
@@ -1395,7 +1433,6 @@ void UpdateAppInfo(SAppInfo &appInfo, const DEBUG_EVENT &evnt)
 
     if (processIndex == appInfo.procs.size())
     {
-      printf("Loaded DLL into unknown process.\n");
       SetConsoleColor(CC_BrightGray, CC_Black);
       break;
     }
@@ -1606,7 +1643,6 @@ void UpdateAppInfo(SAppInfo &appInfo, const DEBUG_EVENT &evnt)
 
     if (processIndex == appInfo.procs.size())
     {
-      printf("Loaded DLL into unknown process.\n");
       SetConsoleColor(CC_BrightGray, CC_Black);
       break;
     }
