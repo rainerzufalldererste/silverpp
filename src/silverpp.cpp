@@ -1117,7 +1117,7 @@ SProfileResult ProfileApplicationNoStackTrace(SAppInfo &appInfo, const SProfileO
                 {
                   size_t bytesRead = 0;
 
-                  if (!ReadProcessMemory(appInfo.procs[processIndex].processHandle, (void *)stackPosition, stackData, sizeof(stackData), &bytesRead))
+                  if (!ReadProcessMemory(appInfo.procs[processIndex].processHandle, reinterpret_cast<void *>(stackPosition), stackData, sizeof(stackData), &bytesRead))
                     break;
 
                   for (int64_t i = stackDataCount - sizeof(size_t) - 1; i >= 0; i--)
@@ -1349,37 +1349,52 @@ void UpdateAppInfo(SAppInfo &appInfo, const DEBUG_EVENT &evnt)
           DWORD bytesRequired = 0;
           HMODULE modules[1024];
 
-          if (0 == EnumProcessModules(procInfo.processHandle, modules, sizeof(modules), &bytesRequired) || bytesRequired < 8 * 3) // <module>, ntdll.dll, kernel32.dll
+          do
           {
-            FATAL("No Modules Available.");
-          }
+            if (0 == EnumProcessModules(procInfo.processHandle, modules, sizeof(modules), &bytesRequired) || bytesRequired < 8 * 1)
+            {
+              puts("Unable to Enumerate Process Modules for new sub process.");
+              break;
+            }
 
-          const uint8_t *pBaseAddress = reinterpret_cast<const uint8_t *>(modules[0]);
-          IMAGE_DOS_HEADER moduleHeader;
-          size_t bytesRead = 0;
-          FATAL_IF(!ReadProcessMemory(procInfo.processHandle, pBaseAddress, &moduleHeader, sizeof(moduleHeader), &bytesRead) || bytesRead != sizeof(moduleHeader), "Failed to Read Module DOS Header. Aborting.");
+            const uint8_t *pBaseAddress = reinterpret_cast<const uint8_t *>(modules[0]);
+            IMAGE_DOS_HEADER moduleHeader;
+            size_t bytesRead = 0;
+            
+            if (!ReadProcessMemory(procInfo.processHandle, pBaseAddress, &moduleHeader, sizeof(moduleHeader), &bytesRead) || bytesRead != sizeof(moduleHeader))
+            {
+              puts("Failed to Read Module DOS Header for new sub process.");
+              break;
+            }
 
-          IMAGE_NT_HEADERS ntHeader;
-          FATAL_IF(!ReadProcessMemory(procInfo.processHandle, pBaseAddress + moduleHeader.e_lfanew, &ntHeader, sizeof(ntHeader), &bytesRead) || bytesRead != sizeof(ntHeader), "Failed to Read Module NT Header. Aborting.");
+            IMAGE_NT_HEADERS ntHeader;
+            
+            if (!ReadProcessMemory(procInfo.processHandle, pBaseAddress + moduleHeader.e_lfanew, &ntHeader, sizeof(ntHeader), &bytesRead) || bytesRead != sizeof(ntHeader))
+            {
+              puts("Failed to Read Module NT Header for new sub process.");
+              break;
+            }
 
-          procInfo.modules[0].moduleBaseAddress = (size_t)pBaseAddress;
-          procInfo.modules[0].startAddress = ntHeader.OptionalHeader.BaseOfCode;
-          procInfo.modules[0].endAddress = procInfo.modules[0].startAddress + (size_t)ntHeader.OptionalHeader.SizeOfCode;
-          procInfo.modules[0].moduleEndAddress = procInfo.modules[0].moduleBaseAddress + procInfo.modules[0].endAddress;
-          procInfo.minimalVirtualAddress = procInfo.modules[0].moduleBaseAddress;
-          procInfo.maximalVirtualAddress = procInfo.modules[0].moduleEndAddress;
+            procInfo.modules[0].moduleBaseAddress = (size_t)pBaseAddress;
+            procInfo.modules[0].startAddress = ntHeader.OptionalHeader.BaseOfCode;
+            procInfo.modules[0].endAddress = procInfo.modules[0].startAddress + (size_t)ntHeader.OptionalHeader.SizeOfCode;
+            procInfo.modules[0].moduleEndAddress = procInfo.modules[0].moduleBaseAddress + procInfo.modules[0].endAddress;
+            procInfo.minimalVirtualAddress = procInfo.modules[0].moduleBaseAddress;
+            procInfo.maximalVirtualAddress = procInfo.modules[0].moduleEndAddress;
 
-          // Place Main Thread in Threads.
-          {
-            SThreadRip mainThread;
-            mainThread.handle = evnt.u.CreateProcessInfo.hThread;
-            mainThread.threadId = GetThreadId(evnt.u.CreateProcessInfo.hThread);
-            mainThread.lastRip = 0;
+            // Place Main Thread in Threads.
+            {
+              SThreadRip mainThread;
+              mainThread.handle = evnt.u.CreateProcessInfo.hThread;
+              mainThread.threadId = GetThreadId(evnt.u.CreateProcessInfo.hThread);
+              mainThread.lastRip = 0;
 
-            procInfo.threads.emplace_back(mainThread);
-          }
+              procInfo.threads.emplace_back(mainThread);
+            }
 
-          appInfo.procs.push_back(std::move(procInfo));
+            appInfo.procs.push_back(std::move(procInfo));
+
+          } while (0);
         }
       }
     }
