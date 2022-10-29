@@ -283,7 +283,7 @@ struct SProcessProfileResult
 
 struct SProfileResult
 {
-  SProcessProfileResult procs[2];
+  SProcessProfileResult procs[1];
   size_t procs_size = 0;
 };
 
@@ -310,7 +310,8 @@ struct SProcessInfo
 
 struct SAppInfo
 {
-  std::vector<SProcessInfo> procs;
+  SProcessInfo procs[1];
+  size_t procs_size = 0;
   size_t runningProcesses = 0;
 };
 
@@ -627,7 +628,7 @@ int32_t main(void)
   procInfo.processId = processInfo.dwProcessId;
 
   SAppInfo appInfo;
-  appInfo.procs.emplace_back(std::move(procInfo));
+  appInfo.procs[appInfo.procs_size++] = std::move(procInfo);
 
   // Start Debugging.
   {
@@ -722,13 +723,13 @@ int32_t main(void)
     {
       size_t processIndex = 0;
 
-      for (; processIndex < appInfo.procs.size(); processIndex++)
+      for (; processIndex < appInfo.procs_size; processIndex++)
         if (appInfo.procs[processIndex].processId == profileSession.procs[i].processId)
           break;
 
       printf("#%" PRIu64 " ", i + 1);
 
-      if (processIndex == appInfo.procs.size())
+      if (processIndex == appInfo.procs_size)
       {
         printf("<Invalid Profile Session for ProcessId %" PRIu32 ">: ", profileSession.procs[i].processId);
       }
@@ -912,11 +913,11 @@ int32_t main(void)
     {
       size_t processIndex = 0;
 
-      for (; processIndex < appInfo.procs.size(); processIndex++)
+      for (; processIndex < appInfo.procs_size; processIndex++)
         if (appInfo.procs[processIndex].processId == profileSession.procs[profileSessionIndex].processId)
           break;
 
-      FATAL_IF(processIndex == appInfo.procs.size(), "Invalid ProcessIndex. Aborting.");
+      FATAL_IF(processIndex == appInfo.procs_size, "Invalid ProcessIndex. Aborting.");
 
       SFuncLineOptions options;
       options.disasmExpensiveLines = !noDisAsm;
@@ -990,12 +991,12 @@ SProfileResult ProfileApplicationNoStackTrace(SAppInfo &appInfo, const SProfileO
 {
   SProfileResult ret;
 
-  for (auto &_process : appInfo.procs)
+  for (size_t i = 0; i < appInfo.procs_size; i++)
   {
     SProcessProfileResult result;
-    result.processId = _process.processId;
+    result.processId = appInfo.procs[i].processId;
 
-    ret.procs[ret.procs_size++] = result;
+    ret.procs[ret.procs_size++] = std::move(result);
   }
 
   FATAL_IF(options.alwaysGetStackTrace, "`alwaysGetStackTrace` is incompatible with this function. Aborting.");
@@ -1026,7 +1027,7 @@ SProfileResult ProfileApplicationNoStackTrace(SAppInfo &appInfo, const SProfileO
 
         if (!hasName)
         {
-          for (size_t processIndex = 0; processIndex < appInfo.procs.size(); processIndex++)
+          for (size_t processIndex = 0; processIndex < appInfo.procs_size; processIndex++)
           {
             if (appInfo.procs[processIndex].processId == debugEvent.dwProcessId)
             {
@@ -1284,6 +1285,8 @@ after_loop:
 
 void UpdateAppInfo(SAppInfo &appInfo, const DEBUG_EVENT &evnt)
 {
+  constexpr size_t processIndex = 0;
+
   switch (evnt.dwDebugEventCode)
   {
   case CREATE_THREAD_DEBUG_EVENT:
@@ -1294,14 +1297,7 @@ void UpdateAppInfo(SAppInfo &appInfo, const DEBUG_EVENT &evnt)
     }
     else
     {
-      size_t processIndex = 0;
-
-      //for (; processIndex < appInfo.procs.size(); processIndex++)
-      //  if (appInfo.procs[processIndex].processId == evnt.dwProcessId)
-      //    break;
-
-      if (processIndex < appInfo.procs.size())
-        appInfo.procs[processIndex].threads.push_back({ evnt.dwThreadId, evnt.u.CreateThread.hThread, 0 });
+      appInfo.procs[processIndex].threads.push_back({ evnt.dwThreadId, evnt.u.CreateThread.hThread, 0 });
     }
 
     break;
@@ -1311,13 +1307,7 @@ void UpdateAppInfo(SAppInfo &appInfo, const DEBUG_EVENT &evnt)
   {
     appInfo.runningProcesses++;
 
-    size_t processIndex = 0;
-
-    //for (; processIndex < appInfo.procs.size(); processIndex++)
-    //  if (appInfo.procs[processIndex].processId == evnt.dwProcessId)
-    //    break;
-
-    if (processIndex == appInfo.procs.size())
+    if (processIndex == appInfo.procs_size)
     {
       char filename[MAX_PATH];
       bool hasName = (0 != GetModuleFileNameExA(evnt.u.CreateProcessInfo.hProcess, nullptr, filename, ARRAYSIZE(filename)));
@@ -1388,8 +1378,8 @@ void UpdateAppInfo(SAppInfo &appInfo, const DEBUG_EVENT &evnt)
               procInfo.threads.emplace_back(mainThread);
             }
 
-            if (appInfo.procs.size() == 0)
-              appInfo.procs.push_back(std::move(procInfo));
+            //if (appInfo.procs_size == 0)
+              appInfo.procs[appInfo.procs_size++] = std::move(procInfo);
 
           } while (0);
         }
@@ -1405,15 +1395,6 @@ void UpdateAppInfo(SAppInfo &appInfo, const DEBUG_EVENT &evnt)
 
   case EXIT_THREAD_DEBUG_EVENT:
   {
-    size_t processIndex = 0;
-
-    //for (; processIndex < appInfo.procs.size(); processIndex++)
-    //  if (appInfo.procs[processIndex].processId == evnt.dwProcessId)
-    //    break;
-
-    if (processIndex == appInfo.procs.size())
-      break;
-
     for (size_t i = 0; i < appInfo.procs[processIndex].threads.size(); i++)
     {
       if (evnt.dwThreadId == appInfo.procs[processIndex].threads[i].threadId)
@@ -1435,19 +1416,8 @@ void UpdateAppInfo(SAppInfo &appInfo, const DEBUG_EVENT &evnt)
     wchar_t filename[MAX_PATH];
     bool hasFilename = false;
 
-    SetConsoleColor(CC_DarkGray, CC_Black);
-
-    size_t processIndex = 0;
-
-    //for (; processIndex < appInfo.procs.size(); processIndex++)
-    //  if (appInfo.procs[processIndex].processId == evnt.dwProcessId)
-    //    break;
-
-    if (processIndex == appInfo.procs.size())
-    {
-      SetConsoleColor(CC_BrightGray, CC_Black);
-      break;
-    }
+    if (_VerboseLogging)
+      SetConsoleColor(CC_DarkGray, CC_Black);
 
     if (GetModuleFileName((HMODULE)evnt.u.LoadDll.lpBaseOfDll, filename, ARRAYSIZE(filename)))
     {
@@ -1496,9 +1466,6 @@ void UpdateAppInfo(SAppInfo &appInfo, const DEBUG_EVENT &evnt)
         else
           printf("Loaded Unknown Module at 0x%" PRIX64 ".", (size_t)evnt.u.LoadDll.lpBaseOfDll);
       }
-
-      if (!hasFilename)
-        wnsprintfW(filename, ARRAYSIZE(filename), L"Unknown Module at 0x%" PRIX64, (size_t)evnt.u.LoadDll.lpBaseOfDll);
     }
 
     {
@@ -1645,19 +1612,8 @@ void UpdateAppInfo(SAppInfo &appInfo, const DEBUG_EVENT &evnt)
   {
     wchar_t filename[MAX_PATH];
 
-    SetConsoleColor(CC_DarkGray, CC_Black);
-
-    size_t processIndex = 0;
-
-    //for (; processIndex < appInfo.procs.size(); processIndex++)
-    //  if (appInfo.procs[processIndex].processId == evnt.dwProcessId)
-    //    break;
-
-    if (processIndex == appInfo.procs.size())
-    {
-      SetConsoleColor(CC_BrightGray, CC_Black);
-      break;
-    }
+    if (_VerboseLogging)
+      SetConsoleColor(CC_DarkGray, CC_Black);
 
     if (GetModuleFileName((HMODULE)evnt.u.LoadDll.lpBaseOfDll, filename, ARRAYSIZE(filename)))
     {
@@ -1697,7 +1653,8 @@ void UpdateAppInfo(SAppInfo &appInfo, const DEBUG_EVENT &evnt)
         printf("Unloaded Unknown Module at 0x%" PRIX64 ".\n", (size_t)evnt.u.LoadDll.lpBaseOfDll);
     }
 
-    SetConsoleColor(CC_BrightGray, CC_Black);
+    if (_VerboseLogging)
+      SetConsoleColor(CC_BrightGray, CC_Black);
 
     break;
   }
@@ -1710,11 +1667,11 @@ SEvalResult EvaluateSession(SAppInfo &appInfo, _Inout_ SProcessProfileResult &pe
 {
   size_t processIndex = 0;
 
-  //for (; processIndex < appInfo.procs.size(); processIndex++)
-  //  if (appInfo.procs[processIndex].processId == perfSession.processId)
-  //    break;
+  for (; processIndex < appInfo.procs_size; processIndex++)
+    if (appInfo.procs[processIndex].processId == perfSession.processId)
+      break;
 
-  FATAL_IF(processIndex == appInfo.procs.size(), "Invalid Process Selected.");
+  FATAL_IF(processIndex == appInfo.procs_size, "Invalid Process Selected.");
 
   SEvalResult ret;
 
