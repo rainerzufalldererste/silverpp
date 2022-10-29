@@ -53,9 +53,9 @@ extern "C"
 ////////////////////////////////////////////////////////////////////////////////
 
 #ifdef _DEBUG
- #define DBG_BREAK() __debugbreak()
+#define DBG_BREAK() __debugbreak()
 #else
- #define DBG_BREAK()
+#define DBG_BREAK()
 #endif
 
 #define FATAL(x, ...) do { printf(x "\n", __VA_ARGS__); DBG_BREAK(); ExitProcess((UINT)-1); } while (0)
@@ -71,7 +71,7 @@ struct SForeignHitEval
   uint8_t foreignModuleIndex;
   uint16_t functionIndex;
   size_t count;
-  
+
   inline bool operator < (const SForeignHitEval &other)
   {
     if (offset == other.offset)
@@ -283,7 +283,8 @@ struct SProcessProfileResult
 
 struct SProfileResult
 {
-  std::vector<SProcessProfileResult> procs;
+  SProcessProfileResult procs[2];
+  size_t procs_size = 0;
 };
 
 struct SEvalResult
@@ -618,7 +619,7 @@ int32_t main(void)
       printf("Attempting to launch '%ws'...\n", appPath);
     else
       printf("Attempting to launch '%ws' with arguments '%ws'...\n", appPath, args + 1);
-    
+
     FATAL_IF(!CreateProcessW(appPath, args, NULL, NULL, FALSE, DEBUG_PROCESS | CREATE_NEW_CONSOLE, NULL, workingDirectory, &startupInfo, &processInfo), "Unable to start process. Aborting.");
   }
 
@@ -648,10 +649,10 @@ int32_t main(void)
     DWORD bytesRequired = 0;
     HMODULE modules[1024];
     DEBUG_EVENT debugEvent;
-    
+
     while (0 == EnumProcessModules(appInfo.procs[0].processHandle, modules, sizeof(modules), &bytesRequired) || bytesRequired < 8 * 3) // <module>, ntdll.dll, kernel32.dll
     {
-      while (WaitForDebugEvent(&debugEvent, 0))
+      if (WaitForDebugEvent(&debugEvent, 0))
       {
         UpdateAppInfo(appInfo, debugEvent);
 
@@ -682,7 +683,7 @@ int32_t main(void)
     appInfo.procs[0].modules[0].moduleEndAddress = appInfo.procs[0].modules[0].moduleBaseAddress + appInfo.procs[0].modules[0].endAddress;
     appInfo.procs[0].minimalVirtualAddress = appInfo.procs[0].modules[0].moduleBaseAddress;
     appInfo.procs[0].maximalVirtualAddress = appInfo.procs[0].modules[0].moduleEndAddress;
-    
+
     // Place Main Thread in Threads.
     {
       SThreadRip mainThread;
@@ -717,7 +718,7 @@ int32_t main(void)
 
     printf("Profiler Stopped.\n");
 
-    for (size_t i = 0; i < profileSession.procs.size(); i++)
+    for (size_t i = 0; i < profileSession.procs_size; i++)
     {
       size_t processIndex = 0;
 
@@ -744,7 +745,7 @@ int32_t main(void)
 
     size_t profileSessionIndex = 0;
 
-    if (profileSession.procs.size() > 1)
+    if (profileSession.procs_size > 1)
     {
       printf("\n Select Profile Session.\n");
 
@@ -753,16 +754,16 @@ int32_t main(void)
 
       profileSessionIndex--;
 
-      FATAL_IF(profileSessionIndex > profileSession.procs.size(), "Invalid Profile Session Selected. Aborting.");
+      FATAL_IF(profileSessionIndex > profileSession.procs_size, "Invalid Profile Session Selected. Aborting.");
     }
 
     size_t totalSamples = 0;
 
-    for (size_t i = 0; i < profileSession.procs.size(); i++)
+    for (size_t i = 0; i < profileSession.procs_size; i++)
       totalSamples += profileSession.procs[i].directHits.size() + profileSession.procs[i].indirectHits.size();
 
     FATAL_IF(totalSamples == 0, "No Samples captured.");
-
+    
     size_t startIndex = 0;
     size_t indirectStartIndex = 0;
     size_t endIndex = 0;
@@ -989,6 +990,14 @@ SProfileResult ProfileApplicationNoStackTrace(SAppInfo &appInfo, const SProfileO
 {
   SProfileResult ret;
 
+  for (auto &_process : appInfo.procs)
+  {
+    SProcessProfileResult result;
+    result.processId = _process.processId;
+
+    ret.procs[ret.procs_size++] = result;
+  }
+
   FATAL_IF(options.alwaysGetStackTrace, "`alwaysGetStackTrace` is incompatible with this function. Aborting.");
 
   DEBUG_EVENT debugEvent;
@@ -997,7 +1006,7 @@ SProfileResult ProfileApplicationNoStackTrace(SAppInfo &appInfo, const SProfileO
   threadContext.ContextFlags = CONTEXT_CONTROL;
 
   size_t lastTicks = GetTickCount64();
-  
+
   while (true)
   {
     const bool hasDebugEvent = WaitForDebugEvent(&debugEvent, (DWORD)options.samplingDelay);
@@ -1014,7 +1023,7 @@ SProfileResult ProfileApplicationNoStackTrace(SAppInfo &appInfo, const SProfileO
 
         char filename[MAX_PATH];
         bool hasName = (0 != GetModuleFileNameExA(debugEvent.u.CreateProcessInfo.hProcess, nullptr, filename, ARRAYSIZE(filename)));
-        
+
         if (!hasName)
         {
           for (size_t processIndex = 0; processIndex < appInfo.procs.size(); processIndex++)
@@ -1050,125 +1059,163 @@ SProfileResult ProfileApplicationNoStackTrace(SAppInfo &appInfo, const SProfileO
 
     const size_t ticks = GetTickCount64();
 
-    for (size_t processIndex = 0; processIndex < appInfo.procs.size(); processIndex++)
+    constexpr size_t processIndex = 0;
+
+    if (ticks > lastTicks + 1000)
     {
-      if (hasDebugEvent)
-        if (appInfo.procs[processIndex].processId != debugEvent.dwProcessId)
-          continue;
+      ret.procs[processIndex].directHitIndexAtSecond.push_back(ret.procs[processIndex].directHits.size());
+      ret.procs[processIndex].indirectHitIndexAtSecond.push_back(ret.procs[processIndex].indirectHits.size());
+      lastTicks = ticks;
+    }
 
-      while (processIndex >= ret.procs.size())
-      {
-        SProcessProfileResult profileResult;
-        profileResult.processId = appInfo.procs[ret.procs.size()].processId;
-
-        ret.procs.emplace_back(std::move(profileResult));
-      }
-
-      if (ticks > lastTicks + 1000)
-      {
-        ret.procs[processIndex].directHitIndexAtSecond.push_back(ret.procs[processIndex].directHits.size());
-        ret.procs[processIndex].indirectHitIndexAtSecond.push_back(ret.procs[processIndex].indirectHits.size());
-        lastTicks = ticks;
-      }
-
-      if (!options.favorPerformance)
-        for (auto &_thread : appInfo.procs[processIndex].threads)
-          if (!hasDebugEvent || debugEvent.dwThreadId != _thread.threadId)
-            SuspendThread(_thread.handle);
-
+    if (!options.favorPerformance)
       for (auto &_thread : appInfo.procs[processIndex].threads)
-      {
-        if (options.favorPerformance && (!hasDebugEvent || debugEvent.dwThreadId != _thread.threadId))
+        if (!hasDebugEvent || debugEvent.dwThreadId != _thread.threadId)
           SuspendThread(_thread.handle);
 
-        if (GetThreadContext(_thread.handle, &threadContext))
+    for (auto &_thread : appInfo.procs[processIndex].threads)
+    {
+      if (options.favorPerformance && (!hasDebugEvent || debugEvent.dwThreadId != _thread.threadId))
+        SuspendThread(_thread.handle);
+
+      if (GetThreadContext(_thread.handle, &threadContext))
+      {
+        if (options.analyzeDelays || threadContext.Rip != _thread.lastRip)
         {
-          if (options.analyzeDelays || threadContext.Rip != _thread.lastRip)
+          bool external = true;
+
+          if (threadContext.Rip >= appInfo.procs[processIndex].minimalVirtualAddress && threadContext.Rip < appInfo.procs[processIndex].maximalVirtualAddress)
           {
-            bool external = true;
-
-            if (threadContext.Rip >= appInfo.procs[processIndex].minimalVirtualAddress && threadContext.Rip < appInfo.procs[processIndex].maximalVirtualAddress)
+            for (const auto &_module : appInfo.procs[processIndex].modules)
             {
-              for (const auto &_module : appInfo.procs[processIndex].modules)
-              {
-                const size_t relativeAddress = threadContext.Rip - _module.moduleBaseAddress;
+              const size_t relativeAddress = threadContext.Rip - _module.moduleBaseAddress;
 
-                if (relativeAddress < _module.endAddress && relativeAddress >= _module.startAddress)
-                {
-                  ret.procs[processIndex].directHits.emplace_back(relativeAddress, (uint8_t)_module.moduleIndex);
-                  external = false;
-                  break;
-                }
+              if (relativeAddress < _module.endAddress && relativeAddress >= _module.startAddress)
+              {
+                ret.procs[processIndex].directHits.emplace_back(relativeAddress, (uint8_t)_module.moduleIndex);
+                external = false;
+                break;
               }
             }
+          }
 
-            if (external && options.getStackTraceOnExtern)
+          if (external && options.getStackTraceOnExtern)
+          {
+            if (options.fastStackTrace)
             {
-              if (options.fastStackTrace)
+              constexpr size_t stackDataCount = 64 * sizeof(size_t);
+              uint8_t stackData[stackDataCount];
+
+              size_t stackPosition = (threadContext.Rsp & ~(size_t)0x4) - sizeof(stackData) + sizeof(size_t);
+
+              bool found = false;
+
+              while ((stackPosition & 0xFFFFF) > sizeof(stackData) * 2)
               {
-                constexpr size_t stackDataCount = 64 * sizeof(size_t);
-                uint8_t stackData[stackDataCount];
+                size_t bytesRead = 0;
 
-                size_t stackPosition = (threadContext.Rsp & ~(size_t)0x4) - sizeof(stackData) + sizeof(size_t);
+                if (!ReadProcessMemory(appInfo.procs[processIndex].processHandle, reinterpret_cast<void *>(stackPosition), stackData, sizeof(stackData), &bytesRead))
+                  break;
 
-                bool found = false;
-
-                while ((stackPosition & 0xFFFFF) > sizeof(stackData) * 2)
+                for (int64_t i = stackDataCount - sizeof(size_t) - 1; i >= 0; i--)
                 {
-                  size_t bytesRead = 0;
+                  const size_t stackValue = *reinterpret_cast<size_t *>(stackData + i);
 
-                  if (!ReadProcessMemory(appInfo.procs[processIndex].processHandle, reinterpret_cast<void *>(stackPosition), stackData, sizeof(stackData), &bytesRead))
-                    break;
-
-                  for (int64_t i = stackDataCount - sizeof(size_t) - 1; i >= 0; i--)
+                  if (stackValue >= appInfo.procs[processIndex].minimalVirtualAddress && stackValue < appInfo.procs[processIndex].maximalVirtualAddress)
                   {
-                    const size_t stackValue = *reinterpret_cast<size_t *>(stackData + i);
-
-                    if (stackValue >= appInfo.procs[processIndex].minimalVirtualAddress && stackValue < appInfo.procs[processIndex].maximalVirtualAddress)
+                    for (const auto &_module : appInfo.procs[processIndex].modules)
                     {
-                      for (const auto &_module : appInfo.procs[processIndex].modules)
+                      if (stackValue >= _module.moduleEndAddress)
+                        break;
+
+                      const size_t virtualAddress = stackValue - _module.moduleBaseAddress;
+
+                      if (virtualAddress >= _module.startAddress)
                       {
-                        if (stackValue >= _module.moduleEndAddress)
-                          break;
+                        ret.procs[processIndex].directHits.emplace_back(virtualAddress, (uint8_t)_module.moduleIndex);
+                        found = true;
+                        break;
+                      }
+                    }
 
-                        const size_t virtualAddress = stackValue - _module.moduleBaseAddress;
+                    if (found)
+                      break;
+                  }
+                }
 
-                        if (virtualAddress >= _module.startAddress)
-                        {
-                          ret.procs[processIndex].directHits.emplace_back(virtualAddress, (uint8_t)_module.moduleIndex);
-                          found = true;
-                          break;
-                        }
+                if (found)
+                  break;
+
+                stackPosition -= sizeof(stackData);
+              }
+            }
+            else
+            {
+              STACKFRAME64 stackFrame;
+              ZeroMemory(&stackFrame, sizeof(stackFrame));
+
+              stackFrame.AddrPC.Offset = threadContext.Rip;
+              stackFrame.AddrPC.Mode = AddrModeFlat;
+              stackFrame.AddrFrame.Offset = threadContext.Rsp;
+              stackFrame.AddrFrame.Mode = AddrModeFlat;
+              stackFrame.AddrStack.Offset = threadContext.Rsp;
+              stackFrame.AddrStack.Mode = AddrModeFlat;
+
+              bool found = false;
+              bool hasIndirectHit = false;
+              SProfileIndirectHit indirectHit;
+
+              if (threadContext.Rip >= appInfo.procs[processIndex].minimalIndirectVirtualAddress && threadContext.Rip < appInfo.procs[processIndex].maximalIndirectVirtualAddress)
+              {
+                size_t foreignModuleIndex = (size_t)-1;
+
+                for (const auto &_module : appInfo.procs[processIndex].foreignModules)
+                {
+                  ++foreignModuleIndex;
+
+                  if (!_module.loaded)
+                    continue;
+
+                  const size_t stackRelativeAddress = stackFrame.AddrPC.Offset - _module.moduleBaseAddress;
+
+                  if (stackRelativeAddress < _module.endAddress && stackRelativeAddress >= _module.startAddress)
+                  {
+                    indirectHit.SetIndirectPart(stackRelativeAddress, (uint8_t)foreignModuleIndex);
+                    hasIndirectHit = true;
+                    break;
+                  }
+                }
+              }
+
+              while (StackWalk64(IMAGE_FILE_MACHINE_AMD64, appInfo.procs[processIndex].processHandle, _thread.handle, &stackFrame, &threadContext, NULL, SymFunctionTableAccess64, SymGetModuleBase64, NULL))
+              {
+                if (stackFrame.AddrPC.Segment == 0 && stackFrame.AddrPC.Offset >= appInfo.procs[processIndex].minimalVirtualAddress && stackFrame.AddrPC.Offset < appInfo.procs[processIndex].maximalVirtualAddress)
+                {
+                  for (const auto &_module : appInfo.procs[processIndex].modules)
+                  {
+                    const size_t stackRelativeAddress = stackFrame.AddrPC.Offset - _module.moduleBaseAddress;
+
+                    if (stackRelativeAddress < _module.endAddress && stackRelativeAddress >= _module.startAddress)
+                    {
+                      SProfileHit hit(stackRelativeAddress, (uint8_t)_module.moduleIndex);
+                      ret.procs[processIndex].directHits.emplace_back(hit);
+
+                      if (hasIndirectHit)
+                      {
+                        indirectHit.ownedModuleHit = hit;
+                        ret.procs[processIndex].indirectHits.emplace_back(indirectHit);
                       }
 
-                      if (found)
-                        break;
+                      found = true;
+                      break;
                     }
                   }
 
                   if (found)
                     break;
-
-                  stackPosition -= sizeof(stackData);
                 }
-              }
-              else
-              {
-                STACKFRAME64 stackFrame;
-                ZeroMemory(&stackFrame, sizeof(stackFrame));
 
-                stackFrame.AddrPC.Offset = threadContext.Rip;
-                stackFrame.AddrPC.Mode = AddrModeFlat;
-                stackFrame.AddrFrame.Offset = threadContext.Rsp;
-                stackFrame.AddrFrame.Mode = AddrModeFlat;
-                stackFrame.AddrStack.Offset = threadContext.Rsp;
-                stackFrame.AddrStack.Mode = AddrModeFlat;
-
-                bool found = false;
-                bool hasIndirectHit = false;
-                SProfileIndirectHit indirectHit;
-
-                if (threadContext.Rip >= appInfo.procs[processIndex].minimalIndirectVirtualAddress && threadContext.Rip < appInfo.procs[processIndex].maximalIndirectVirtualAddress)
+                if (stackFrame.AddrPC.Segment == 0 && stackFrame.AddrPC.Offset >= appInfo.procs[processIndex].minimalIndirectVirtualAddress && stackFrame.AddrPC.Offset < appInfo.procs[processIndex].maximalIndirectVirtualAddress)
                 {
                   size_t foreignModuleIndex = (size_t)-1;
 
@@ -1189,73 +1236,22 @@ SProfileResult ProfileApplicationNoStackTrace(SAppInfo &appInfo, const SProfileO
                     }
                   }
                 }
-
-                while (StackWalk64(IMAGE_FILE_MACHINE_AMD64, appInfo.procs[processIndex].processHandle, _thread.handle, &stackFrame, &threadContext, NULL, SymFunctionTableAccess64, SymGetModuleBase64, NULL))
-                {
-                  if (stackFrame.AddrPC.Segment == 0 && stackFrame.AddrPC.Offset >= appInfo.procs[processIndex].minimalVirtualAddress && stackFrame.AddrPC.Offset < appInfo.procs[processIndex].maximalVirtualAddress)
-                  {
-                    for (const auto &_module : appInfo.procs[processIndex].modules)
-                    {
-                      const size_t stackRelativeAddress = stackFrame.AddrPC.Offset - _module.moduleBaseAddress;
-
-                      if (stackRelativeAddress < _module.endAddress && stackRelativeAddress >= _module.startAddress)
-                      {
-                        SProfileHit hit(stackRelativeAddress, (uint8_t)_module.moduleIndex);
-                        ret.procs[processIndex].directHits.emplace_back(hit);
-
-                        if (hasIndirectHit)
-                        {
-                          indirectHit.ownedModuleHit = hit;
-                          ret.procs[processIndex].indirectHits.emplace_back(indirectHit);
-                        }
-
-                        found = true;
-                        break;
-                      }
-                    }
-
-                    if (found)
-                      break;
-                  }
-
-                  if (stackFrame.AddrPC.Segment == 0 && stackFrame.AddrPC.Offset >= appInfo.procs[processIndex].minimalIndirectVirtualAddress && stackFrame.AddrPC.Offset < appInfo.procs[processIndex].maximalIndirectVirtualAddress)
-                  {
-                    size_t foreignModuleIndex = (size_t)-1;
-
-                    for (const auto &_module : appInfo.procs[processIndex].foreignModules)
-                    {
-                      ++foreignModuleIndex;
-
-                      if (!_module.loaded)
-                        continue;
-
-                      const size_t stackRelativeAddress = stackFrame.AddrPC.Offset - _module.moduleBaseAddress;
-
-                      if (stackRelativeAddress < _module.endAddress && stackRelativeAddress >= _module.startAddress)
-                      {
-                        indirectHit.SetIndirectPart(stackRelativeAddress, (uint8_t)foreignModuleIndex);
-                        hasIndirectHit = true;
-                        break;
-                      }
-                    }
-                  }
-                }
               }
             }
-
-            _thread.lastRip = threadContext.Rip;
           }
-        }
 
-        if (options.favorPerformance && (!hasDebugEvent || debugEvent.dwThreadId != _thread.threadId))
-          ResumeThread(_thread.handle);
+          _thread.lastRip = threadContext.Rip;
+        }
       }
 
-      if (!options.favorPerformance)
-        for (auto &_thread : appInfo.procs[processIndex].threads)
-          if (!hasDebugEvent || debugEvent.dwThreadId != _thread.threadId)
-            ResumeThread(_thread.handle);
+      if (options.favorPerformance && (!hasDebugEvent || debugEvent.dwThreadId != _thread.threadId))
+        ResumeThread(_thread.handle);
     }
+
+    if (!options.favorPerformance)
+      for (auto &_thread : appInfo.procs[processIndex].threads)
+        if (!hasDebugEvent || debugEvent.dwThreadId != _thread.threadId)
+          ResumeThread(_thread.handle);
 
     if (hasDebugEvent)
     {
@@ -1278,7 +1274,7 @@ SProfileResult ProfileApplicationNoStackTrace(SAppInfo &appInfo, const SProfileO
 
 after_loop:
 
-  for (size_t i = 0; i < ret.procs.size(); i++)
+  for (size_t i = 0; i < ret.procs_size; i++)
     ret.procs[i].directHitIndexAtSecond.push_back(ret.procs[i].directHits.size());
 
   return ret;
@@ -1300,9 +1296,9 @@ void UpdateAppInfo(SAppInfo &appInfo, const DEBUG_EVENT &evnt)
     {
       size_t processIndex = 0;
 
-      for (; processIndex < appInfo.procs.size(); processIndex++)
-        if (appInfo.procs[processIndex].processId == evnt.dwProcessId)
-          break;
+      //for (; processIndex < appInfo.procs.size(); processIndex++)
+      //  if (appInfo.procs[processIndex].processId == evnt.dwProcessId)
+      //    break;
 
       if (processIndex < appInfo.procs.size())
         appInfo.procs[processIndex].threads.push_back({ evnt.dwThreadId, evnt.u.CreateThread.hThread, 0 });
@@ -1317,9 +1313,9 @@ void UpdateAppInfo(SAppInfo &appInfo, const DEBUG_EVENT &evnt)
 
     size_t processIndex = 0;
 
-    for (; processIndex < appInfo.procs.size(); processIndex++)
-      if (appInfo.procs[processIndex].processId == evnt.dwProcessId)
-        break;
+    //for (; processIndex < appInfo.procs.size(); processIndex++)
+    //  if (appInfo.procs[processIndex].processId == evnt.dwProcessId)
+    //    break;
 
     if (processIndex == appInfo.procs.size())
     {
@@ -1360,7 +1356,7 @@ void UpdateAppInfo(SAppInfo &appInfo, const DEBUG_EVENT &evnt)
             const uint8_t *pBaseAddress = reinterpret_cast<const uint8_t *>(modules[0]);
             IMAGE_DOS_HEADER moduleHeader;
             size_t bytesRead = 0;
-            
+
             if (!ReadProcessMemory(procInfo.processHandle, pBaseAddress, &moduleHeader, sizeof(moduleHeader), &bytesRead) || bytesRead != sizeof(moduleHeader))
             {
               puts("Failed to Read Module DOS Header for new sub process.");
@@ -1368,7 +1364,7 @@ void UpdateAppInfo(SAppInfo &appInfo, const DEBUG_EVENT &evnt)
             }
 
             IMAGE_NT_HEADERS ntHeader;
-            
+
             if (!ReadProcessMemory(procInfo.processHandle, pBaseAddress + moduleHeader.e_lfanew, &ntHeader, sizeof(ntHeader), &bytesRead) || bytesRead != sizeof(ntHeader))
             {
               puts("Failed to Read Module NT Header for new sub process.");
@@ -1392,7 +1388,8 @@ void UpdateAppInfo(SAppInfo &appInfo, const DEBUG_EVENT &evnt)
               procInfo.threads.emplace_back(mainThread);
             }
 
-            appInfo.procs.push_back(std::move(procInfo));
+            if (appInfo.procs.size() == 0)
+              appInfo.procs.push_back(std::move(procInfo));
 
           } while (0);
         }
@@ -1410,9 +1407,9 @@ void UpdateAppInfo(SAppInfo &appInfo, const DEBUG_EVENT &evnt)
   {
     size_t processIndex = 0;
 
-    for (; processIndex < appInfo.procs.size(); processIndex++)
-      if (appInfo.procs[processIndex].processId == evnt.dwProcessId)
-        break;
+    //for (; processIndex < appInfo.procs.size(); processIndex++)
+    //  if (appInfo.procs[processIndex].processId == evnt.dwProcessId)
+    //    break;
 
     if (processIndex == appInfo.procs.size())
       break;
@@ -1442,9 +1439,9 @@ void UpdateAppInfo(SAppInfo &appInfo, const DEBUG_EVENT &evnt)
 
     size_t processIndex = 0;
 
-    for (; processIndex < appInfo.procs.size(); processIndex++)
-      if (appInfo.procs[processIndex].processId == evnt.dwProcessId)
-        break;
+    //for (; processIndex < appInfo.procs.size(); processIndex++)
+    //  if (appInfo.procs[processIndex].processId == evnt.dwProcessId)
+    //    break;
 
     if (processIndex == appInfo.procs.size())
     {
@@ -1512,7 +1509,7 @@ void UpdateAppInfo(SAppInfo &appInfo, const DEBUG_EVENT &evnt)
         IMAGE_DOS_HEADER moduleHeader;
         IMAGE_NT_HEADERS ntHeader;
         size_t bytesRead = 0;
-        
+
         if (!ReadProcessMemory(appInfo.procs[processIndex].processHandle, evnt.u.LoadDll.lpBaseOfDll, &moduleHeader, sizeof(moduleHeader), &bytesRead) || bytesRead != sizeof(moduleHeader) || !ReadProcessMemory(appInfo.procs[processIndex].processHandle, reinterpret_cast<const uint8_t *>(evnt.u.LoadDll.lpBaseOfDll) + moduleHeader.e_lfanew, &ntHeader, sizeof(ntHeader), &bytesRead) || bytesRead != sizeof(ntHeader))
         {
           if (_VerboseLogging)
@@ -1652,9 +1649,9 @@ void UpdateAppInfo(SAppInfo &appInfo, const DEBUG_EVENT &evnt)
 
     size_t processIndex = 0;
 
-    for (; processIndex < appInfo.procs.size(); processIndex++)
-      if (appInfo.procs[processIndex].processId == evnt.dwProcessId)
-        break;
+    //for (; processIndex < appInfo.procs.size(); processIndex++)
+    //  if (appInfo.procs[processIndex].processId == evnt.dwProcessId)
+    //    break;
 
     if (processIndex == appInfo.procs.size())
     {
@@ -1713,9 +1710,9 @@ SEvalResult EvaluateSession(SAppInfo &appInfo, _Inout_ SProcessProfileResult &pe
 {
   size_t processIndex = 0;
 
-  for (; processIndex < appInfo.procs.size(); processIndex++)
-    if (appInfo.procs[processIndex].processId == perfSession.processId)
-      break;
+  //for (; processIndex < appInfo.procs.size(); processIndex++)
+  //  if (appInfo.procs[processIndex].processId == perfSession.processId)
+  //    break;
 
   FATAL_IF(processIndex == appInfo.procs.size(), "Invalid Process Selected.");
 
@@ -2051,7 +2048,7 @@ bool LoadBinary(SAppInfo &appInfo, const size_t processIndex, const size_t modul
   ERROR_RETURN_IF(fileContents == nullptr, "Failed to allocate memory.");
 
   const size_t fileSize = fread(fileContents, 1, expectedFileSize, pFile);
-  
+
   if ((size_t)expectedFileSize != fileSize)
   {
     free(fileContents);
@@ -2280,7 +2277,7 @@ bool InstrumentDisassembly(SAppInfo &appInfo, const size_t processIndex, const S
             }
           }
         }
-        
+
         if (!found && mappedAddress >= appInfo.procs[processIndex].minimalIndirectVirtualAddress && mappedAddress < appInfo.procs[processIndex].maximalIndirectVirtualAddress)
         {
           for (const auto &_module : appInfo.procs[processIndex].foreignModules)
@@ -2364,7 +2361,7 @@ bool InstrumentFunctionDisassembly(SAppInfo &appInfo, const size_t processIndex,
   const size_t endAddress = (function.hitsOffset.size() ? min(function.symbolStartPos + function.hitsOffset[function.hitsOffset.size() - 1] + 16, function.symbolEndPos) : function.symbolEndPos) + 1; // just to even decode single instructions.
 
   const bool result = InstrumentDisassembly(appInfo, processIndex, function, startAddress, endAddress, options, maxHit, &indirectHitStartIndex);
-  
+
   SetConsoleColor(CC_BrightGray, CC_Black);
 
   return result;
