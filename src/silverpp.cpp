@@ -1076,9 +1076,6 @@ SProfileResult ProfileApplicationNoStackTrace(SAppInfo &appInfo, const SProfileO
 
     for (auto &_thread : appInfo.procs[processIndex].threads)
     {
-      if (options.favorPerformance && (!hasDebugEvent || debugEvent.dwThreadId != _thread.threadId))
-        SuspendThread(_thread.handle);
-
       if (GetThreadContext(_thread.handle, &threadContext))
       {
         if (options.analyzeDelays || threadContext.Rip != _thread.lastRip)
@@ -1102,6 +1099,9 @@ SProfileResult ProfileApplicationNoStackTrace(SAppInfo &appInfo, const SProfileO
 
           if (external && options.getStackTraceOnExtern)
           {
+            if (options.favorPerformance && (!hasDebugEvent || debugEvent.dwThreadId != _thread.threadId))
+              SuspendThread(_thread.handle);
+
             if (options.fastStackTrace)
             {
               constexpr size_t stackDataCount = 64 * sizeof(size_t);
@@ -1239,14 +1239,14 @@ SProfileResult ProfileApplicationNoStackTrace(SAppInfo &appInfo, const SProfileO
                 }
               }
             }
+
+            if (options.favorPerformance && (!hasDebugEvent || debugEvent.dwThreadId != _thread.threadId))
+              ResumeThread(_thread.handle);
           }
 
           _thread.lastRip = threadContext.Rip;
         }
       }
-
-      if (options.favorPerformance && (!hasDebugEvent || debugEvent.dwThreadId != _thread.threadId))
-        ResumeThread(_thread.handle);
     }
 
     if (!options.favorPerformance)
@@ -1378,8 +1378,7 @@ void UpdateAppInfo(SAppInfo &appInfo, const DEBUG_EVENT &evnt)
               procInfo.threads.emplace_back(mainThread);
             }
 
-            //if (appInfo.procs_size == 0)
-              appInfo.procs[appInfo.procs_size++] = std::move(procInfo);
+            appInfo.procs[appInfo.procs_size++] = std::move(procInfo);
 
           } while (0);
         }
