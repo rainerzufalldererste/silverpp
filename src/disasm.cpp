@@ -114,7 +114,7 @@ bool InstrumentDisassembly(SAppInfo &appInfo, const size_t processIndex, const S
 
     while (hitIndex < function.hitsOffset.size())
     {
-      if (function.hitsOffset[hitIndex] > virtualAddressOffset + instruction.length) // Yes, this is technically off by one, however this appears to be correct.
+      if (function.hitsOffset[hitIndex] > virtualAddressOffset + instruction.length - 1)
         break;
       else if (function.hitsOffset[hitIndex] >= virtualAddressOffset)
         hits++;
