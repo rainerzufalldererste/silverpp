@@ -48,8 +48,8 @@
 #ifndef NO_DISASM
 extern "C"
 {
-#define ZYCORE_STATIC_DEFINE
-#include <Zydis/Zydis.h>
+#define ZYDIS_STATIC_BUILD
+#include "Zydis.h"
 }
 #endif
 

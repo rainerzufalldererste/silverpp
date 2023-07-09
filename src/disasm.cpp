@@ -30,35 +30,35 @@
 
 ////////////////////////////////////////////////////////////////////////////////
 
-uint64_t _GetAddressFromOperand(const ZydisDecodedInstruction *pInstruction, const size_t operatorIndex, const size_t virtualAddress)
+uint64_t _GetAddressFromOperand(const ZydisDecodedInstruction *pInstruction, const ZydisDecodedOperand operands[10], const size_t operatorIndex, const size_t virtualAddress)
 {
   uint64_t ptr = 0;
 
-  switch (pInstruction->operands[operatorIndex].type)
+  switch (operands[operatorIndex].type)
   {
   case ZYDIS_OPERAND_TYPE_IMMEDIATE:
   {
     if (pInstruction->mnemonic == ZYDIS_MNEMONIC_MOV || pInstruction->mnemonic == ZYDIS_MNEMONIC_LEA)
       return (uint64_t)-1;
 
-    if (pInstruction->operands[operatorIndex].imm.is_relative)
+    if (operands[operatorIndex].imm.is_relative)
       ptr = (uint64_t)(virtualAddress + pInstruction->length);
 
-    if (pInstruction->operands[operatorIndex].imm.is_signed)
-      ptr = (int64_t)ptr + (int64_t)(pInstruction->operands[operatorIndex].imm.value.s);
+    if (operands[operatorIndex].imm.is_signed)
+      ptr = (int64_t)ptr + (int64_t)(operands[operatorIndex].imm.value.s);
     else
-      ptr = (uint64_t)(pInstruction->operands[operatorIndex].imm.value.u);
+      ptr = (uint64_t)(operands[operatorIndex].imm.value.u);
 
     break;
   }
 
   case ZYDIS_OPERAND_TYPE_MEMORY:
   {
-    if (pInstruction->operands[operatorIndex].mem.segment != ZYDIS_REGISTER_DS)
+    if (operands[operatorIndex].mem.segment != ZYDIS_REGISTER_DS)
       return (uint64_t)-1;
 
-    if (pInstruction->operands[operatorIndex].mem.base == ZYDIS_REGISTER_RIP)
-      ptr = virtualAddress + pInstruction->length + pInstruction->operands[operatorIndex].mem.disp.value;
+    if (operands[operatorIndex].mem.base == ZYDIS_REGISTER_RIP)
+      ptr = virtualAddress + pInstruction->length + operands[operatorIndex].mem.disp.value;
     else
       return (uint64_t)-1;
 
@@ -67,10 +67,10 @@ uint64_t _GetAddressFromOperand(const ZydisDecodedInstruction *pInstruction, con
 
   case ZYDIS_OPERAND_TYPE_POINTER:
   {
-    if (pInstruction->operands[operatorIndex].ptr.segment != ZYDIS_REGISTER_DS)
+    if (operands[operatorIndex].ptr.segment != ZYDIS_REGISTER_DS)
       return (uint64_t)-1;
 
-    ptr = virtualAddress + pInstruction->length + pInstruction->operands[operatorIndex].ptr.offset; // TODO: Is this valid?
+    ptr = virtualAddress + pInstruction->length + operands[operatorIndex].ptr.offset; // TODO: Is this valid?
   }
   }
   return ptr;
@@ -80,6 +80,7 @@ bool InstrumentDisassembly(SAppInfo &appInfo, const size_t processIndex, const S
 {
   size_t virtualAddress = startAddress;
   ZydisDecodedInstruction instruction;
+  ZydisDecodedOperand operands[10];
   char disasmBuffer[1024] = {};
 
   const uint8_t *pBinaryAtAddress = appInfo.procs[processIndex].modules[function.moduleIndex].pBinary;
@@ -106,8 +107,8 @@ bool InstrumentDisassembly(SAppInfo &appInfo, const size_t processIndex, const S
 
   while (virtualAddress < endAddress)
   {
-    ERROR_RETURN_IF(!(ZYAN_SUCCESS(ZydisDecoderDecodeBuffer(&appInfo.procs[processIndex].modules[function.moduleIndex].decoder, pBinaryAtAddress, endAddress - virtualAddress + 32 /* Just to force decoding the last instruction */, &instruction))), "Invalid Instruction at 0x%" PRIX64 ".", virtualAddress);
-    ERROR_RETURN_IF(!ZYAN_SUCCESS(ZydisFormatterFormatInstruction(&appInfo.procs[processIndex].modules[function.moduleIndex].formatter, &instruction, disasmBuffer, sizeof(disasmBuffer), virtualAddress)), "Failed to Format Instruction at 0x%" PRIX64 ".", virtualAddress);
+    ERROR_RETURN_IF(!(ZYAN_SUCCESS(ZydisDecoderDecodeFull(&appInfo.procs[processIndex].modules[function.moduleIndex].decoder, pBinaryAtAddress, endAddress - virtualAddress + 32 /* Just to force decoding the last instruction */, &instruction, operands))), "Invalid Instruction at 0x%" PRIX64 ".", virtualAddress);
+    ERROR_RETURN_IF(!ZYAN_SUCCESS(ZydisFormatterFormatInstruction(&appInfo.procs[processIndex].modules[function.moduleIndex].formatter, &instruction, operands, ARRAYSIZE(operands), disasmBuffer, sizeof(disasmBuffer), virtualAddress, nullptr)), "Failed to Format Instruction at 0x%" PRIX64 ".", virtualAddress);
 
     size_t hits = 0;
     const size_t virtualAddressOffset = virtualAddress - function.symbolStartPos;
@@ -154,7 +155,7 @@ bool InstrumentDisassembly(SAppInfo &appInfo, const size_t processIndex, const S
     case ZYDIS_MNEMONIC_JNS:
     case ZYDIS_MNEMONIC_JNZ:
     {
-      const uint64_t operandAddress = _GetAddressFromOperand(&instruction, 0, virtualAddress);
+      const uint64_t operandAddress = _GetAddressFromOperand(&instruction, operands, 0, virtualAddress);
 
       if (operandAddress != (uint64_t)-1)
       {
