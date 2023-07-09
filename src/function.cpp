@@ -253,35 +253,24 @@ bool EvaluateFunction(_In_ CComPtr<IDiaSession> &session, _In_ const SPerfEval &
 
   ERROR_RETURN_IF(function.sector == (DWORD)-1 || function.offset == (DWORD)-1, "Unknown Sector or Offset for this Function.");
 
-  std::vector<uint32_t> missingHits;
-
   for (size_t i = 0; i < function.hitsOffset.size(); i++)
   {
     CComPtr<IDiaEnumLineNumbers> lineNumEnum;
 
     if (FAILED(session->findLinesByAddr(function.sector, function.offset + function.hitsOffset[i], 1, &lineNumEnum)))
-    {
-      missingHits.push_back(function.hitsOffset[i]);
       continue;
-    }
 
     CComPtr<IDiaLineNumber> lineNumber;
 
     ULONG fetched;
 
     if (FAILED(lineNumEnum->Next(1, &lineNumber, &fetched)) || fetched == 0)
-    {
-      missingHits.push_back(function.hitsOffset[i]);
       continue;
-    }
 
     DWORD sourceFileId;
 
     if (FAILED(lineNumber->get_sourceFileId(&sourceFileId)))
-    {
-      missingHits.push_back(function.hitsOffset[i]);
       continue;
-    }
 
     uint32_t fileIndex = 0;
 
@@ -301,10 +290,7 @@ bool EvaluateFunction(_In_ CComPtr<IDiaSession> &session, _In_ const SPerfEval &
       CComPtr<IDiaSourceFile> sourceFile;
 
       if (FAILED(lineNumber->get_sourceFile(&sourceFile)))
-      {
-        missingHits.push_back(function.hitsOffset[i]);
         continue;
-      }
 
       wchar_t *sourceFileName = nullptr;
 
@@ -320,10 +306,7 @@ bool EvaluateFunction(_In_ CComPtr<IDiaSession> &session, _In_ const SPerfEval &
     DWORD line = 0;
 
     if (FAILED(lineNumber->get_lineNumber(&line)))
-    {
-      missingHits.push_back(function.hitsOffset[i]);
       continue;
-    }
 
     size_t address;
 
