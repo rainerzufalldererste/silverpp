@@ -368,7 +368,7 @@ bool LoadBinary(SAppInfo &appInfo, const size_t processIndex, const size_t modul
   appInfo.procs[processIndex].modules[moduleIndex].pBinary = fileContents;
   appInfo.procs[processIndex].modules[moduleIndex].binaryLength = fileSize;
 
-  ERROR_RETURN_IF(!ZYAN_SUCCESS(ZydisDecoderInit(&appInfo.procs[processIndex].modules[moduleIndex].decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_ADDRESS_WIDTH_64)), "Failed to initialize disassembler.");
+  ERROR_RETURN_IF(!ZYAN_SUCCESS(ZydisDecoderInit(&appInfo.procs[processIndex].modules[moduleIndex].decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64)), "Failed to initialize disassembler.");
   ERROR_RETURN_IF(!ZYAN_SUCCESS(ZydisFormatterInit(&appInfo.procs[processIndex].modules[moduleIndex].formatter, ZYDIS_FORMATTER_STYLE_INTEL)) || !ZYAN_SUCCESS(ZydisFormatterSetProperty(&appInfo.procs[processIndex].modules[moduleIndex].formatter, ZYDIS_FORMATTER_PROP_FORCE_SEGMENT, ZYAN_TRUE)) || !ZYAN_SUCCESS(ZydisFormatterSetProperty(&appInfo.procs[processIndex].modules[moduleIndex].formatter, ZYDIS_FORMATTER_PROP_FORCE_SIZE, ZYAN_TRUE)), "Failed to initialize instruction formatter.");
 
   appInfo.procs[processIndex].modules[moduleIndex].hasDisasm = true;
