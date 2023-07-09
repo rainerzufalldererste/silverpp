@@ -58,6 +58,12 @@ wchar_t _CMD_PARAM_NO_DISASM[] = TEXT(CMD_PARAM_NO_DISASM);
 #define CMD_PARAM_VERBOSE "--verbose"
 wchar_t _CMD_PARAM_VERBOSE[] = TEXT(CMD_PARAM_VERBOSE);
 
+#define CMD_PARAM_STORE_SESSION "--store-session"
+wchar_t _CMD_PARAM_STORE_SESSION[] = TEXT(CMD_PARAM_STORE_SESSION);
+
+#define CMD_PARAM_LOAD_SESSION "--load-session"
+wchar_t _CMD_PARAM_LOAD_SESSION[] = TEXT(CMD_PARAM_LOAD_SESSION);
+
 ////////////////////////////////////////////////////////////////////////////////
 
 int32_t main(void)
@@ -66,7 +72,7 @@ int32_t main(void)
 
   int32_t argc = 0;
   wchar_t **pArgv = CommandLineToArgvW(commandLine, &argc);
-  FATAL_IF(argc == 1, "\nUsage: silverpp <ExecutablePath>\n\n Optional Parameters:\n\n\t" CMD_PARAM_INDIRECT_HITS "\t\t | Trace external Samples back to the calling Function\n\t" CMD_PARAM_STACK_TRACE "\t\t\t | Capture Stack Traces for all Samples\n\t" CMD_PARAM_FAST_STACK_TRACE "\t\t | Fast (but possibly less accurate) Stack Traces\n\t" CMD_PARAM_FAVOR_ACCURACY "\t | Favor Sampling Accuracy over Application Performance\n\t" CMD_PARAM_ANALYZE_DELAYS "\t | Capture sample even if stuck on the same instruction (may cause accidental multiple hits)\n\t" CMD_PARAM_SAMPLING_DELAY " <milliseconds>\t | Additional Sampling Delay (Improves performance at the cost of Samples)\n\t" CMD_PARAM_NO_DISASM "\t\t | Don't display disassembly for expensive lines\n\t" CMD_PARAM_VERBOSE "\t\t | Enable verbose logging\n\t" CMD_PARAM_ARGS_PASS_THROUGH " <Args>\t\t | Pass the remaining Arguments to the Application being profiled\n");
+  FATAL_IF(argc == 1, "\nUsage: silverpp <ExecutablePath>\n\n Optional Parameters:\n\n\t" CMD_PARAM_INDIRECT_HITS "\t\t | Trace external Samples back to the calling Function\n\t" CMD_PARAM_STACK_TRACE "\t\t\t | Capture Stack Traces for all Samples\n\t" CMD_PARAM_FAST_STACK_TRACE "\t\t | Fast (but possibly less accurate) Stack Traces\n\t" CMD_PARAM_FAVOR_ACCURACY "\t | Favor Sampling Accuracy over Application Performance\n\t" CMD_PARAM_ANALYZE_DELAYS "\t | Capture sample even if stuck on the same instruction (may cause accidental multiple hits)\n\t" CMD_PARAM_SAMPLING_DELAY " <milliseconds>\t | Additional Sampling Delay (Improves performance at the cost of Samples)\n\t" CMD_PARAM_NO_DISASM "\t\t | Don't display disassembly for expensive lines\n\t" CMD_PARAM_VERBOSE "\t\t | Enable verbose logging\n\t" CMD_PARAM_STORE_SESSION " <File>\t | Store the captured state in a file.\n\t" CMD_PARAM_LOAD_SESSION " <File>\t | Load a captured state from file.\n\t" CMD_PARAM_ARGS_PASS_THROUGH " <Args>\t\t | Pass the remaining Arguments to the Application being profiled\n");
 
   wchar_t workingDirectory[MAX_PATH];
   FATAL_IF(0 == GetCurrentDirectory(ARRAYSIZE(workingDirectory), workingDirectory), "Failed to retrieve working directory. Aborting.");
@@ -81,6 +87,8 @@ int32_t main(void)
   bool favorAccuracy = false;
   bool analyzeDelays = false;
   bool noDisAsm = false;
+  const wchar_t *storeSessionName = nullptr;
+  const wchar_t *loadSessionName = nullptr;
   size_t samplingDelay = 0;
 
   int32_t argsRemaining = argc - 2;
@@ -144,6 +152,20 @@ int32_t main(void)
       argsRemaining--;
       argIndex++;
     }
+    else if (wcscmp(pArgv[argIndex], _CMD_PARAM_STORE_SESSION) == 0 && argsRemaining > 1)
+    {
+      storeSessionName = pArgv[argIndex + 1];
+
+      argsRemaining -= 2;
+      argIndex += 2;
+    }
+    else if (wcscmp(pArgv[argIndex], _CMD_PARAM_LOAD_SESSION) == 0 && argsRemaining > 1)
+    {
+      loadSessionName = pArgv[argIndex + 1];
+
+      argsRemaining -= 2;
+      argIndex += 2;
+    }
     else if (wcscmp(pArgv[argIndex], _CMD_PARAM_ARGS) == 0 && argsRemaining > 1)
     {
       args = commandLine + wcslen(pArgv[0]) + wcslen(pArgv[1]) + 2;
@@ -192,6 +214,7 @@ int32_t main(void)
   ZeroMemory(&processInfo, sizeof(processInfo));
 
   // Start Process.
+  if (!loadSessionName)
   {
     STARTUPINFO startupInfo;
     ZeroMemory(&startupInfo, sizeof(startupInfo));
@@ -212,6 +235,7 @@ int32_t main(void)
   appInfo.procs[appInfo.procs_size++] = std::move(procInfo);
 
   // Start Debugging.
+  if (!loadSessionName)
   {
     DEBUG_EVENT debugEvent;
 
@@ -227,6 +251,7 @@ int32_t main(void)
   }
 
   // Get Base Address of Main Module.
+  if (!loadSessionName)
   {
     DWORD bytesRequired = 0;
     HMODULE modules[1024];
@@ -296,55 +321,67 @@ int32_t main(void)
     profileOptions.analyzeDelays = analyzeDelays;
     profileOptions.samplingDelay = samplingDelay;
 
-    SProfileResult profileSession = ProfileApplicationNoStackTrace(appInfo, profileOptions);
-
-    printf("Profiler Stopped.\n");
-
-    for (size_t i = 0; i < profileSession.procs_size; i++)
-    {
-      size_t processIndex = 0;
-
-      for (; processIndex < appInfo.procs_size; processIndex++)
-        if (appInfo.procs[processIndex].processId == profileSession.procs[i].processId)
-          break;
-
-      printf("#%" PRIu64 " ", i + 1);
-
-      if (processIndex == appInfo.procs_size)
-      {
-        printf("<Invalid Profile Session for ProcessId %" PRIu32 ">: ", profileSession.procs[i].processId);
-      }
-      else
-      {
-        if (appInfo.procs[processIndex].hasName)
-          printf("'%s' (ProcessId %" PRIu32 "): ", appInfo.procs[processIndex].name, profileSession.procs[i].processId);
-        else
-          printf("ProcessId %" PRIu32 ": ", profileSession.procs[i].processId);
-      }
-
-      printf("Captured % " PRIu64 " direct (& %" PRIu64 " indirect) hits.\n", profileSession.procs[i].directHits.size(), profileSession.procs[i].indirectHits.size());
-    }
-
+    SProfileResult profileSession;
     size_t profileSessionIndex = 0;
 
-    if (profileSession.procs_size > 1)
+    if (!loadSessionName)
     {
-      printf("\n Select Profile Session.\n");
+      profileSession = std::move(ProfileApplicationNoStackTrace(appInfo, profileOptions));
 
-      if (1 != scanf("%" PRIu64 "", &profileSessionIndex))
-        profileSessionIndex = 0;
+      printf("Profiler Stopped.\n");
 
-      profileSessionIndex--;
+      for (size_t i = 0; i < profileSession.procs_size; i++)
+      {
+        size_t processIndex = 0;
 
-      FATAL_IF(profileSessionIndex > profileSession.procs_size, "Invalid Profile Session Selected. Aborting.");
+        for (; processIndex < appInfo.procs_size; processIndex++)
+          if (appInfo.procs[processIndex].processId == profileSession.procs[i].processId)
+            break;
+
+        printf("#%" PRIu64 " ", i + 1);
+
+        if (processIndex == appInfo.procs_size)
+        {
+          printf("<Invalid Profile Session for ProcessId %" PRIu32 ">: ", profileSession.procs[i].processId);
+        }
+        else
+        {
+          if (appInfo.procs[processIndex].hasName)
+            printf("'%s' (ProcessId %" PRIu32 "): ", appInfo.procs[processIndex].name, profileSession.procs[i].processId);
+          else
+            printf("ProcessId %" PRIu32 ": ", profileSession.procs[i].processId);
+        }
+
+        printf("Captured % " PRIu64 " direct (& %" PRIu64 " indirect) hits.\n", profileSession.procs[i].directHits.size(), profileSession.procs[i].indirectHits.size());
+      }
+
+      if (profileSession.procs_size > 1)
+      {
+        printf("\n Select Profile Session.\n");
+
+        if (1 != scanf("%" PRIu64 "", &profileSessionIndex))
+          profileSessionIndex = 0;
+
+        profileSessionIndex--;
+
+        FATAL_IF(profileSessionIndex > profileSession.procs_size, "Invalid Profile Session Selected. Aborting.");
+      }
+
+      size_t totalSamples = 0;
+
+      for (size_t i = 0; i < profileSession.procs_size; i++)
+        totalSamples += profileSession.procs[i].directHits.size() + profileSession.procs[i].indirectHits.size();
+
+      FATAL_IF(totalSamples == 0, "No Samples captured.");
+
+      if (storeSessionName != nullptr)
+        if (!StoreSession(storeSessionName, appInfo, profileSession))
+          printf("Failed to store session in '%ls'.\n", storeSessionName);
     }
-
-    size_t totalSamples = 0;
-
-    for (size_t i = 0; i < profileSession.procs_size; i++)
-      totalSamples += profileSession.procs[i].directHits.size() + profileSession.procs[i].indirectHits.size();
-
-    FATAL_IF(totalSamples == 0, "No Samples captured.");
+    else
+    {
+      FATAL_IF(!LoadSession(loadSessionName, &appInfo, &profileSession), "Failed to load profile session from '%ls'. Aborting.", loadSessionName);
+    }
     
     size_t startIndex = 0;
     size_t indirectStartIndex = 0;

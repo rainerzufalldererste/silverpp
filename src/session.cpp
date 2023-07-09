@@ -257,3 +257,425 @@ SEvalResult EvaluateSession(SAppInfo &appInfo, _Inout_ SProcessProfileResult &pe
 
   return ret;
 }
+
+////////////////////////////////////////////////////////////////////////////////
+
+struct BinaryReader
+{
+  uint8_t *pData = nullptr;
+  size_t size = 0;
+  size_t position = 0;
+
+  inline BinaryReader(uint8_t *pData, const size_t size) : pData(pData), size(size) {};
+  inline ~BinaryReader() { free(pData); pData = nullptr; }
+};
+
+////////////////////////////////////////////////////////////////////////////////
+
+template <typename T>
+bool LoadValue(_Inout_ BinaryReader &reader, _Out_ T *pV, const size_t count = 1)
+{
+  if (reader.position + sizeof(T) * count > reader.size)
+    return false;
+
+  memcpy(pV, reader.pData + reader.position, sizeof(T) * count);
+
+  reader.position += sizeof(T) * count;
+
+  return true;
+}
+
+template <typename T>
+bool LoadVector(_Inout_ BinaryReader &reader, _Out_ std::vector<T> *pV)
+{
+  size_t count = 0;
+
+  if (!LoadValue(reader, &count))
+    return false;
+
+  for (size_t i = 0; i < count; i++)
+  {
+    T v;
+
+    if (!LoadValue(reader, &v))
+      return false;
+
+    pV->push_back(std::move(v));
+  }
+
+  return true;
+}
+
+bool LoadValue(_Inout_ BinaryReader &reader, SThreadRip *pRip)
+{
+  pRip->handle = nullptr;
+
+  if (!LoadValue(reader, &pRip->threadId))
+    return false;
+  
+  if (!LoadValue(reader, &pRip->lastRip))
+    return false;
+
+  return true;
+}
+
+bool LoadValue(_Inout_ BinaryReader &reader, SModuleInfo *pInfo)
+{
+  pInfo->hasDisasm = false;
+  pInfo->pdbSession = nullptr;
+
+  if (!LoadValue(reader, &pInfo->moduleBaseAddress) || !LoadValue(reader, &pInfo->moduleEndAddress) || !LoadValue(reader, &pInfo->startAddress) || !LoadValue(reader, &pInfo->endAddress) || !LoadValue(reader, pInfo->filename, ARRAYSIZE(pInfo->filename)) || !LoadValue(reader, &pInfo->nameOffset) || !LoadValue(reader, &pInfo->moduleIndex))
+    return false;
+
+  CComPtr<IDiaDataSource> pdbSource;
+
+  if (FAILED(CoCreateInstance(CLSID_DiaSource, nullptr, CLSCTX_INPROC_SERVER, __uuidof(IDiaDataSource), (void **)&pdbSource)) || FAILED(pdbSource->loadDataForExe(pInfo->filename, nullptr, nullptr)) || FAILED(pdbSource->openSession(&pInfo->pdbSession)))
+  {
+    if (_VerboseLogging)
+      printf(" (Failed to load PDB for '%ls')\n", pInfo->filename);
+  }
+
+  return true;
+}
+
+bool LoadValue(_Inout_ BinaryReader &reader, SNamedLibraryInfo *pInfo)
+{
+  if (!LoadValue(reader, pInfo->filename, ARRAYSIZE(pInfo->filename)) || !LoadValue(reader, &pInfo->nameOffset) || !LoadValue(reader, &pInfo->moduleBaseAddress) || !LoadValue(reader, &pInfo->moduleEndAddress) || !LoadValue(reader, &pInfo->startAddress) || !LoadValue(reader, &pInfo->endAddress) || !LoadValue(reader, &pInfo->loaded))
+    return false;
+
+  if (!LoadVector(reader, &pInfo->functions))
+    return false;
+
+  return true;
+}
+
+bool LoadValue(_Inout_ BinaryReader &reader, SLibraryFunction *pFunc)
+{
+  if (!LoadValue(reader, pFunc->name, ARRAYSIZE(pFunc->name)) || !LoadValue(reader, &pFunc->virtualAddressOffset))
+    return false;
+
+  return true;
+}
+
+bool LoadValue(_Inout_ BinaryReader &reader, SProcessInfo *pProcessInfo)
+{
+  if (!LoadValue(reader, &pProcessInfo->processId) || !LoadValue(reader, &pProcessInfo->hasName) || !LoadValue(reader, pProcessInfo->name, ARRAYSIZE(pProcessInfo->name)))
+    return false;
+
+  if (!LoadVector(reader, &pProcessInfo->threads))
+    return false;
+
+  {
+    size_t count = 0;
+
+    if (!LoadValue(reader, &count))
+      return false;
+
+    for (size_t i = 0; i < count; i++)
+    {
+      SModuleInfo m;
+
+      if (!LoadValue(reader, &m))
+        return false;
+
+      if (i == 0)
+      {
+        if (wcsncmp(m.filename, pProcessInfo->modules[0].filename, ARRAYSIZE(m.filename)) != 0)
+        {
+          printf("WARNING: The filename of the loaded session ('%ls') doesn't correspond to the filename launched alongside the executable ('%ls').\n", m.filename, pProcessInfo->modules[0].filename);
+        }
+
+        pProcessInfo->modules[0].moduleBaseAddress = m.moduleBaseAddress;
+        pProcessInfo->modules[0].moduleEndAddress = m.moduleEndAddress;
+        pProcessInfo->modules[0].startAddress = m.startAddress;
+        pProcessInfo->modules[0].endAddress = m.endAddress;
+      }
+      else
+      {
+        pProcessInfo->modules.push_back(std::move(m));
+      }
+    }
+  }
+  
+  if (!LoadVector(reader, &pProcessInfo->inactiveModules))
+    return false;
+
+  if (!LoadVector(reader, &pProcessInfo->foreignModules))
+    return false;
+
+  return true;
+}
+
+bool LoadValue(_Inout_ BinaryReader &reader, SProfileHit *pResult)
+{
+  if (!LoadValue(reader, &pResult->packed))
+    false;
+
+  return true;
+}
+
+bool LoadValue(_Inout_ BinaryReader &reader, SProfileIndirectHit *pResult)
+{
+  if (!LoadValue(reader, &pResult->packed) || !LoadValue(reader, &pResult->packed))
+    return false;
+
+  return true;
+}
+
+bool LoadValue(_Inout_ BinaryReader &reader, SProcessProfileResult *pResult)
+{
+  if (!LoadValue(reader, &pResult->processId))
+    return false;
+  
+  if (!LoadVector(reader, &pResult->directHits))
+    return false;
+
+  if (!LoadVector(reader, &pResult->directHitIndexAtSecond))
+    return false;
+
+  if (!LoadVector(reader, &pResult->indirectHits))
+    return false;
+
+  if (!LoadVector(reader, &pResult->indirectHitIndexAtSecond))
+    return false;
+
+  return true;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+struct BinaryWriter
+{
+  uint8_t *pData = nullptr;
+  size_t size = 0;
+  size_t capacity = 0;
+
+  inline ~BinaryWriter() { if (pData) free(pData); pData = nullptr; capacity = 0; size = 0; }
+
+  inline bool reserve(const size_t bytes)
+  {
+    if (capacity >= size + bytes)
+      return true;
+
+    const size_t newCapacity = (max(size + bytes * 2, size * 2 + 1) + 1023) & ~(size_t)1023;
+
+    pData = reinterpret_cast<uint8_t *>(realloc(pData, newCapacity));
+
+    if (pData == nullptr)
+      return false;
+
+    capacity = newCapacity;
+
+    return true;
+  }
+};
+
+////////////////////////////////////////////////////////////////////////////////
+
+template <typename T>
+bool StoreValue(_Inout_ BinaryWriter &writer, const T &v)
+{
+  writer.reserve(sizeof(T));
+  memcpy(writer.pData + writer.size, &v, sizeof(T));
+  writer.size += sizeof(T);
+
+  return true;
+}
+
+template <typename T>
+bool StoreValue(_Inout_ BinaryWriter &writer, const T *pV, const size_t count)
+{
+  writer.reserve(sizeof(T) * count);
+  memcpy(writer.pData + writer.size, pV, sizeof(T) * count);
+  writer.size += sizeof(T) * count;
+
+  return true;
+}
+
+template <typename T>
+bool StoreVector(_Inout_ BinaryWriter &writer, const std::vector<T> &v)
+{
+  StoreValue(writer, v.size());
+  
+  for (size_t i = 0; i < v.size(); i++)
+    if (!StoreValue(writer, v[i]))
+      return false;
+
+  return true;
+}
+
+bool StoreValue(_Inout_ BinaryWriter &writer, const SThreadRip &rip)
+{
+  StoreValue(writer, rip.threadId);
+  StoreValue(writer, rip.lastRip);
+
+  return true;
+}
+
+bool StoreValue(_Inout_ BinaryWriter &writer, const SModuleInfo &info)
+{
+  StoreValue(writer, info.moduleBaseAddress);
+  StoreValue(writer, info.moduleEndAddress);
+  StoreValue(writer, info.startAddress);
+  StoreValue(writer, info.endAddress);
+  StoreValue(writer, info.filename, ARRAYSIZE(info.filename));
+  StoreValue(writer, info.nameOffset);
+  StoreValue(writer, info.moduleIndex);
+
+  return true;
+}
+
+bool StoreValue(_Inout_ BinaryWriter &writer, const SNamedLibraryInfo &info)
+{
+  StoreValue(writer, info.filename, ARRAYSIZE(info.filename));
+  StoreValue(writer, info.nameOffset);
+  StoreValue(writer, info.moduleBaseAddress);
+  StoreValue(writer, info.moduleEndAddress);
+  StoreValue(writer, info.startAddress);
+  StoreValue(writer, info.endAddress);
+  StoreValue(writer, info.loaded);
+
+  if (!StoreVector(writer,  info.functions))
+    return false;
+
+  return true;
+}
+
+bool StoreValue(_Inout_ BinaryWriter &writer, const SLibraryFunction &func)
+{
+  StoreValue(writer, func.name, ARRAYSIZE(func.name));
+  StoreValue(writer, func.virtualAddressOffset);
+
+  return true;
+}
+
+bool StoreValue(_Inout_ BinaryWriter &writer, const SProcessInfo &processInfo)
+{
+  StoreValue(writer, processInfo.processId);
+  StoreValue(writer, processInfo.hasName);
+  StoreValue(writer, processInfo.name, ARRAYSIZE(processInfo.name));
+  
+  if (!StoreVector(writer,  processInfo.threads))
+    return false;
+  
+  if (!StoreVector(writer,  processInfo.modules))
+    return false;
+  
+  if (!StoreVector(writer,  processInfo.inactiveModules))
+    return false;
+  
+  if (!StoreVector(writer,  processInfo.foreignModules))
+    return false;
+
+  return true;
+}
+
+bool StoreValue(_Inout_ BinaryWriter &writer, const SProfileHit &result)
+{
+  StoreValue(writer, result.packed);
+
+  return true;
+}
+
+bool StoreValue(_Inout_ BinaryWriter &writer, const SProfileIndirectHit &result)
+{
+  StoreValue(writer, result.packed);
+  StoreValue(writer, result.packed);
+
+  return true;
+}
+
+bool StoreValue(_Inout_ BinaryWriter &writer, const SProcessProfileResult &result)
+{
+  StoreValue(writer, result.processId);
+  StoreVector(writer,  result.directHits);
+  StoreVector(writer,  result.directHitIndexAtSecond);
+  StoreVector(writer,  result.indirectHits);
+  StoreVector(writer,  result.indirectHitIndexAtSecond);
+
+  return true;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+constexpr uint32_t FormatVersion = 1;
+
+bool StoreSession(const wchar_t *filename, const SAppInfo &appInfo, _In_ const SProfileResult &result)
+{
+  BinaryWriter writer;
+  StoreValue(writer, FormatVersion);
+
+  if (!StoreValue(writer, appInfo.procs[0]))
+    return false;
+
+  if (!StoreValue(writer, result.procs[0]))
+    return false;
+
+  FILE *pFile = _wfopen(filename, L"wb");
+  
+  if (pFile == nullptr)
+    return false;
+
+  if (writer.size != fwrite(writer.pData, 1, writer.size, pFile))
+  {
+    fclose(pFile);
+    return false;
+  }
+
+  fclose(pFile);
+
+  return true;
+}
+
+bool LoadSession(const wchar_t *filename, _Out_ SAppInfo *pAppInfo, _Out_ SProfileResult *pResult)
+{
+  FILE *pFile = _wfopen(filename, L"rb");
+
+  if (pFile == nullptr)
+    return false;
+
+  fseek(pFile, 0, SEEK_END);
+  const size_t fileSize = _ftelli64(pFile);
+
+  if (fileSize == 0)
+    return false;
+
+  fseek(pFile, 0, SEEK_SET);
+
+  uint8_t *pData = reinterpret_cast<uint8_t *>(malloc(fileSize));
+
+  if (pData == nullptr)
+  {
+    fclose(pFile);
+    return false;
+  }
+
+  BinaryReader reader(pData, fileSize); // will free `pData` on scope end.
+  pData = nullptr;
+
+  if (reader.size != fread(reader.pData, 1, reader.size, pFile))
+  {
+    fclose(pFile);
+    return false;
+  }
+
+  fclose(pFile);
+
+  uint32_t formatVersion;
+
+  if (!LoadValue(reader, &formatVersion) || formatVersion != FormatVersion)
+    return false;
+
+  pAppInfo->procs_size = 1;
+  pAppInfo->runningProcesses = 0;
+
+  if (!LoadValue(reader, &pAppInfo->procs[0]))
+    return false;
+
+  pResult->procs_size = 1;
+
+  if (!LoadValue(reader, &pResult->procs[0]))
+    return false;
+
+  return true;
+}

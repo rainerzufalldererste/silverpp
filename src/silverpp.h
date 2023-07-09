@@ -422,8 +422,8 @@ SProfileResult ProfileApplicationNoStackTrace(SAppInfo &appInfo, const SProfileO
 void UpdateAppInfo(SAppInfo &appInfo, const DEBUG_EVENT &evnt);
 SEvalResult EvaluateSession(SAppInfo &appInfo, _Inout_ SProcessProfileResult &perfSession, const size_t startIndex, const size_t endIndex, const size_t indirectStartIndex, const size_t indirectEndIndex);
 
-bool StoreCapture(const wchar_t *pFilename, const SAppInfo &appInfo, _In_ const SProfileResult &result);
-bool LoadCapture(const wchar_t *pFilename, _Out_ SAppInfo *pAppInfo, _Out_ SProfileResult *pResult);
+bool StoreSession(const wchar_t *filename, const SAppInfo &appInfo, _In_ const SProfileResult &result);
+bool LoadSession(const wchar_t *filename, _Out_ SAppInfo *pAppInfo, _Out_ SProfileResult *pResult);
 
 // Returns the next start index, when displaying incrementally.
 size_t DisplayOffsetIndirectHits(SAppInfo &appInfo, const size_t processIndex, const SPerfEval &function, const size_t startOffset, const size_t endOffset, const size_t indirectHitsStartIndex);
