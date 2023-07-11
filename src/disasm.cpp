@@ -28,7 +28,99 @@
 
 #include "silverpp.h"
 
+#include "zydec.h"
+
 ////////////////////////////////////////////////////////////////////////////////
+
+struct ResolveAddressData
+{
+  SProcessInfo *pProcessInfo;
+  const SPerfEval *pFunction;
+};
+
+////////////////////////////////////////////////////////////////////////////////
+
+bool _ResolveAddressToFriendlyName(const size_t virtualAddress, char *friendlyName, const size_t friendlyNameCapacity, size_t *pOffsetFromStart, void *pUserData)
+{
+  ResolveAddressData *pData = static_cast<ResolveAddressData *>(pUserData);
+
+  const uint64_t mappedAddress = virtualAddress + pData->pProcessInfo->modules[pData->pFunction->moduleIndex].moduleBaseAddress;
+
+  size_t moduleIndex = (size_t)-1;
+
+  if (mappedAddress >= pData->pProcessInfo->minimalVirtualAddress || mappedAddress < pData->pProcessInfo->maximalVirtualAddress)
+  {
+    for (const auto &_module : pData->pProcessInfo->modules)
+    {
+      ++moduleIndex;
+
+      if (mappedAddress >= _module.moduleBaseAddress && mappedAddress < _module.moduleEndAddress)
+      {
+        CComPtr<IDiaEnumSymbolsByAddr> enumerator;
+        CComPtr<IDiaSymbol> symbol;
+        wchar_t *symbolName = nullptr;
+        size_t symbolStartAddress = 0;
+
+        if (SUCCEEDED(_module.pdbSession->getSymbolsByAddr(&enumerator)) && SUCCEEDED(enumerator->symbolByAddr(1, (DWORD)(mappedAddress - _module.moduleBaseAddress - _module.startAddress), &symbol)) && SUCCEEDED(symbol->get_name(&symbolName)) && SUCCEEDED(symbol->get_virtualAddress(&symbolStartAddress)))
+        {
+          if (moduleIndex != (size_t)pData->pFunction->moduleIndex)
+            snprintf(friendlyName, friendlyNameCapacity, "[%ls: %ls]", _module.filename + _module.nameOffset, symbolName);
+          else
+            snprintf(friendlyName, friendlyNameCapacity, "%ls", symbolName);
+
+          *pOffsetFromStart = (mappedAddress - _module.moduleBaseAddress) - symbolStartAddress;
+        }
+        else
+        {
+          snprintf(friendlyName, friendlyNameCapacity, "[%ls: <UNKNOWN_FUNCTION>]", _module.filename + _module.nameOffset);
+        }
+
+        if (symbolName != nullptr)
+          SysFreeString(symbolName);
+
+        return true;
+      }
+    }
+  }
+
+  if (mappedAddress >= pData->pProcessInfo->minimalIndirectVirtualAddress && mappedAddress < pData->pProcessInfo->maximalIndirectVirtualAddress)
+  {
+    for (const auto &_module : pData->pProcessInfo->foreignModules)
+    {
+      if (mappedAddress >= _module.moduleBaseAddress && mappedAddress < _module.moduleEndAddress)
+      {
+        size_t lastFunctionIndex = (size_t)-1;
+        size_t lastOffset = (size_t)-1;
+
+        for (const auto &_symbol : _module.functions)
+        {
+          const size_t mappedStartAddress = _symbol.virtualAddressOffset + _module.moduleBaseAddress;
+
+          if (_symbol.virtualAddressOffset <= mappedStartAddress)
+            lastOffset = mappedAddress - mappedStartAddress;
+          else
+            break;
+
+          lastFunctionIndex++;
+        }
+
+        if (lastOffset == (size_t)-1)
+        {
+          snprintf(friendlyName, friendlyNameCapacity, "[%ls: <UNKNOWN_FUNCTION>]", _module.filename + _module.nameOffset);
+        }
+        else
+        {
+          *pOffsetFromStart = lastOffset;
+          snprintf(friendlyName, friendlyNameCapacity, "[%ls: %s]", _module.filename + _module.nameOffset, _module.functions[lastFunctionIndex].name);
+        }
+
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
 
 uint64_t _GetAddressFromOperand(const ZydisDecodedInstruction *pInstruction, const ZydisDecodedOperand operands[10], const size_t operatorIndex, const size_t virtualAddress)
 {
@@ -81,7 +173,15 @@ bool InstrumentDisassembly(SAppInfo &appInfo, const size_t processIndex, const S
   size_t virtualAddress = startAddress;
   ZydisDecodedInstruction instruction;
   ZydisDecodedOperand operands[10];
-  char disasmBuffer[1024] = {};
+  char textBuffer[1024] = {};
+
+  ResolveAddressData resolveData;
+  resolveData.pProcessInfo = &appInfo.procs[processIndex];
+  resolveData.pFunction = &function;
+
+  ZydecFormattingInfo info;
+  info.pResolveAddressToFriendlyName = _ResolveAddressToFriendlyName;
+  info.pUserData = &resolveData;
 
   const uint8_t *pBinaryAtAddress = appInfo.procs[processIndex].modules[function.moduleIndex].pBinary;
 
@@ -108,7 +208,7 @@ bool InstrumentDisassembly(SAppInfo &appInfo, const size_t processIndex, const S
   while (virtualAddress < endAddress)
   {
     ERROR_RETURN_IF(!(ZYAN_SUCCESS(ZydisDecoderDecodeFull(&appInfo.procs[processIndex].modules[function.moduleIndex].decoder, pBinaryAtAddress, endAddress - virtualAddress + 32 /* Just to force decoding the last instruction */, &instruction, operands))), "Invalid Instruction at 0x%" PRIX64 ".", virtualAddress);
-    ERROR_RETURN_IF(!ZYAN_SUCCESS(ZydisFormatterFormatInstruction(&appInfo.procs[processIndex].modules[function.moduleIndex].formatter, &instruction, operands, ARRAYSIZE(operands), disasmBuffer, sizeof(disasmBuffer), virtualAddress, nullptr)), "Failed to Format Instruction at 0x%" PRIX64 ".", virtualAddress);
+    ERROR_RETURN_IF(!ZYAN_SUCCESS(ZydisFormatterFormatInstruction(&appInfo.procs[processIndex].modules[function.moduleIndex].formatter, &instruction, operands, ARRAYSIZE(operands), textBuffer, sizeof(textBuffer), virtualAddress, nullptr)), "Failed to Format Instruction at 0x%" PRIX64 ".", virtualAddress);
 
     size_t hits = 0;
     const size_t virtualAddressOffset = virtualAddress - function.symbolStartPos;
@@ -124,133 +224,157 @@ bool InstrumentDisassembly(SAppInfo &appInfo, const size_t processIndex, const S
     }
 
     SetConsoleColor(hits > expensiveThreshold ? CC_BrightCyan : CC_DarkCyan, CC_Black);
-
-    if (hits > 0)
-      printf("0x%08" PRIX64 " | % 5" PRIu64 " | %s", virtualAddress, hits, disasmBuffer);
-    else
-      printf("0x%08" PRIX64 " |       | %s", virtualAddress, disasmBuffer);
-
-    switch (instruction.mnemonic)
+    
+    if (!options.decompileExpensiveLines)
     {
-    case ZYDIS_MNEMONIC_CALL:
-    case ZYDIS_MNEMONIC_JMP:
-    case ZYDIS_MNEMONIC_JB:
-    case ZYDIS_MNEMONIC_JBE:
-    case ZYDIS_MNEMONIC_JCXZ:
-    case ZYDIS_MNEMONIC_JECXZ:
-    case ZYDIS_MNEMONIC_JKNZD:
-    case ZYDIS_MNEMONIC_JKZD:
-    case ZYDIS_MNEMONIC_JL:
-    case ZYDIS_MNEMONIC_JZ:
-    case ZYDIS_MNEMONIC_JS:
-    case ZYDIS_MNEMONIC_JO:
-    case ZYDIS_MNEMONIC_JP:
-    case ZYDIS_MNEMONIC_JLE:
-    case ZYDIS_MNEMONIC_JNB:
-    case ZYDIS_MNEMONIC_JNBE:
-    case ZYDIS_MNEMONIC_JNL:
-    case ZYDIS_MNEMONIC_JNLE:
-    case ZYDIS_MNEMONIC_JNO:
-    case ZYDIS_MNEMONIC_JNP:
-    case ZYDIS_MNEMONIC_JNS:
-    case ZYDIS_MNEMONIC_JNZ:
-    {
-      const uint64_t operandAddress = _GetAddressFromOperand(&instruction, operands, 0, virtualAddress);
+      if (hits > 0)
+        printf("0x%08" PRIX64 " | % 5" PRIu64 " | %s", virtualAddress, hits, textBuffer);
+      else
+        printf("0x%08" PRIX64 " |       | %s", virtualAddress, textBuffer);
 
-      if (operandAddress != (uint64_t)-1)
+      switch (instruction.mnemonic)
       {
-        const uint64_t mappedAddress = operandAddress + appInfo.procs[processIndex].modules[function.moduleIndex].moduleBaseAddress;
+      case ZYDIS_MNEMONIC_CALL:
+      case ZYDIS_MNEMONIC_JMP:
+      case ZYDIS_MNEMONIC_JB:
+      case ZYDIS_MNEMONIC_JBE:
+      case ZYDIS_MNEMONIC_JCXZ:
+      case ZYDIS_MNEMONIC_JECXZ:
+      case ZYDIS_MNEMONIC_JKNZD:
+      case ZYDIS_MNEMONIC_JKZD:
+      case ZYDIS_MNEMONIC_JL:
+      case ZYDIS_MNEMONIC_JZ:
+      case ZYDIS_MNEMONIC_JS:
+      case ZYDIS_MNEMONIC_JO:
+      case ZYDIS_MNEMONIC_JP:
+      case ZYDIS_MNEMONIC_JLE:
+      case ZYDIS_MNEMONIC_JNB:
+      case ZYDIS_MNEMONIC_JNBE:
+      case ZYDIS_MNEMONIC_JNL:
+      case ZYDIS_MNEMONIC_JNLE:
+      case ZYDIS_MNEMONIC_JNO:
+      case ZYDIS_MNEMONIC_JNP:
+      case ZYDIS_MNEMONIC_JNS:
+      case ZYDIS_MNEMONIC_JNZ:
+      {
+        const uint64_t operandAddress = _GetAddressFromOperand(&instruction, operands, 0, virtualAddress);
 
-        size_t moduleIndex = (size_t)-1;
-        bool found = false;
-
-        if (mappedAddress >= appInfo.procs[processIndex].minimalVirtualAddress || mappedAddress < appInfo.procs[processIndex].maximalVirtualAddress)
+        if (operandAddress != (uint64_t)-1)
         {
-          for (const auto &_module : appInfo.procs[processIndex].modules)
+          const uint64_t mappedAddress = operandAddress + appInfo.procs[processIndex].modules[function.moduleIndex].moduleBaseAddress;
+
+          size_t moduleIndex = (size_t)-1;
+          bool found = false;
+
+          if (mappedAddress >= appInfo.procs[processIndex].minimalVirtualAddress || mappedAddress < appInfo.procs[processIndex].maximalVirtualAddress)
           {
-            ++moduleIndex;
-
-            if (mappedAddress >= _module.moduleBaseAddress && mappedAddress < _module.moduleEndAddress)
+            for (const auto &_module : appInfo.procs[processIndex].modules)
             {
-              CComPtr<IDiaEnumSymbolsByAddr> enumerator;
-              CComPtr<IDiaSymbol> symbol;
-              wchar_t *symbolName = nullptr;
-              size_t symbolStartAddress = 0;
+              ++moduleIndex;
 
-              if (SUCCEEDED(_module.pdbSession->getSymbolsByAddr(&enumerator)) && SUCCEEDED(enumerator->symbolByAddr(1, (DWORD)(mappedAddress - _module.moduleBaseAddress - _module.startAddress), &symbol)) && SUCCEEDED(symbol->get_name(&symbolName)) && SUCCEEDED(symbol->get_virtualAddress(&symbolStartAddress)))
+              if (mappedAddress >= _module.moduleBaseAddress && mappedAddress < _module.moduleEndAddress)
               {
-                if (moduleIndex != (size_t)function.moduleIndex)
-                  printf("\t\t\t\t[%ws - ", _module.filename + _module.nameOffset);
-                else
-                  printf("\t\t\t\t[");
+                CComPtr<IDiaEnumSymbolsByAddr> enumerator;
+                CComPtr<IDiaSymbol> symbol;
+                wchar_t *symbolName = nullptr;
+                size_t symbolStartAddress = 0;
 
-                if (symbolStartAddress == function.symbolStartPos && moduleIndex == (size_t)function.moduleIndex)
+                if (SUCCEEDED(_module.pdbSession->getSymbolsByAddr(&enumerator)) && SUCCEEDED(enumerator->symbolByAddr(1, (DWORD)(mappedAddress - _module.moduleBaseAddress - _module.startAddress), &symbol)) && SUCCEEDED(symbol->get_name(&symbolName)) && SUCCEEDED(symbol->get_virtualAddress(&symbolStartAddress)))
                 {
-                  printf("%+" PRIi64 " (0x%08" PRIX64 ")]", operandAddress - virtualAddress, operandAddress);
-                }
-                else
-                {
-                  const size_t offset = (mappedAddress - _module.moduleBaseAddress) - symbolStartAddress;
-
-                  if (offset == 0)
-                    printf("%ws]", symbolName);
+                  if (moduleIndex != (size_t)function.moduleIndex)
+                    printf("\t\t\t\t[%ws - ", _module.filename + _module.nameOffset);
                   else
-                    printf("%ws + 0x%" PRIX64 "]", symbolName, offset);
+                    printf("\t\t\t\t[");
+
+                  if (symbolStartAddress == function.symbolStartPos && moduleIndex == (size_t)function.moduleIndex)
+                  {
+                    printf("%+" PRIi64 " (0x%08" PRIX64 ")]", operandAddress - virtualAddress, operandAddress);
+                  }
+                  else
+                  {
+                    const size_t offset = (mappedAddress - _module.moduleBaseAddress) - symbolStartAddress;
+
+                    if (offset == 0)
+                      printf("%ws]", symbolName);
+                    else
+                      printf("%ws + 0x%" PRIX64 "]", symbolName, offset);
+                  }
                 }
-              }
-              else
-              {
-                printf("\t\t\t\t[%ws - <UNKNOWN_FUNCTION>]", _module.filename + _module.nameOffset);
-              }
-
-              if (symbolName != nullptr)
-                SysFreeString(symbolName);
-
-              break;
-            }
-          }
-        }
-
-        if (!found && mappedAddress >= appInfo.procs[processIndex].minimalIndirectVirtualAddress && mappedAddress < appInfo.procs[processIndex].maximalIndirectVirtualAddress)
-        {
-          for (const auto &_module : appInfo.procs[processIndex].foreignModules)
-          {
-            if (mappedAddress >= _module.moduleBaseAddress && mappedAddress < _module.moduleEndAddress)
-            {
-              printf("\t\t\t\t[%ws - ", _module.filename + _module.nameOffset);
-              size_t lastFunctionIndex = (size_t)-1;
-              size_t lastOffset = (size_t)-1;
-
-              for (const auto &_symbol : _module.functions)
-              {
-                const size_t mappedStartAddress = _symbol.virtualAddressOffset + _module.moduleBaseAddress;
-
-                if (_symbol.virtualAddressOffset <= mappedStartAddress)
-                  lastOffset = mappedAddress - mappedStartAddress;
                 else
-                  break;
+                {
+                  printf("\t\t\t\t[%ws - <UNKNOWN_FUNCTION>]", _module.filename + _module.nameOffset);
+                }
 
-                lastFunctionIndex++;
+                if (symbolName != nullptr)
+                  SysFreeString(symbolName);
+
+                found = true;
+                break;
               }
+            }
+          }
 
-              if (lastOffset == (size_t)-1)
-                printf("<UNKNOWN_FUNCTION>]");
-              else if (lastOffset == 0)
-                printf("%s]", _module.functions[lastFunctionIndex].name);
-              else
-                printf("%s +%" PRIu64 "]", _module.functions[lastFunctionIndex].name, lastOffset);
+          if (!found && mappedAddress >= appInfo.procs[processIndex].minimalIndirectVirtualAddress && mappedAddress < appInfo.procs[processIndex].maximalIndirectVirtualAddress)
+          {
+            for (const auto &_module : appInfo.procs[processIndex].foreignModules)
+            {
+              if (mappedAddress >= _module.moduleBaseAddress && mappedAddress < _module.moduleEndAddress)
+              {
+                printf("\t\t\t\t[%ws - ", _module.filename + _module.nameOffset);
+                size_t lastFunctionIndex = (size_t)-1;
+                size_t lastOffset = (size_t)-1;
 
-              break;
+                for (const auto &_symbol : _module.functions)
+                {
+                  const size_t mappedStartAddress = _symbol.virtualAddressOffset + _module.moduleBaseAddress;
+
+                  if (_symbol.virtualAddressOffset <= mappedStartAddress)
+                    lastOffset = mappedAddress - mappedStartAddress;
+                  else
+                    break;
+
+                  lastFunctionIndex++;
+                }
+
+                if (lastOffset == (size_t)-1)
+                  printf("<UNKNOWN_FUNCTION>]");
+                else if (lastOffset == 0)
+                  printf("%s]", _module.functions[lastFunctionIndex].name);
+                else
+                  printf("%s +%" PRIu64 "]", _module.functions[lastFunctionIndex].name, lastOffset);
+
+                break;
+              }
             }
           }
         }
+
+        break;
+      }
       }
 
-      break;
+      puts("");
     }
-    }
+    else
+    {
+      if (hits > 0)
+        printf("0x%08" PRIX64 " | % 5" PRIu64 " | %-64s | ", virtualAddress, hits, textBuffer);
+      else
+        printf("0x%08" PRIX64 " |       | %-64s | ", virtualAddress, textBuffer);
 
-    puts("");
+      bool hasTranslation = false;
+
+      if (zydec_TranslateInstructionWithoutContext(&instruction, operands, sizeof(operands) / sizeof(operands[0]), virtualAddress, textBuffer, sizeof(textBuffer), &hasTranslation, &info) && hasTranslation)
+      {
+        SetConsoleColor(hits > expensiveThreshold ? CC_BrightBlue : CC_DarkBlue, CC_Black);
+
+        puts(textBuffer);
+      }
+      else
+      {
+        puts("");
+      }
+    }
 
     *pIndirectHitsStartIndex = DisplayOffsetIndirectHits(appInfo, processIndex, function, virtualAddress, virtualAddress + instruction.length, *pIndirectHitsStartIndex);
 

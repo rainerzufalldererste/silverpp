@@ -1,0 +1,3 @@
+[submodule "3rdParty/zydec"]
+	path = 3rdParty/zydec
+	url = https://github.com/rainerzufalldererste/zydec.git

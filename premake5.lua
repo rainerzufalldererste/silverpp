@@ -17,3 +17,4 @@ solution "silverpp"
   end
 
   dofile "project.lua"
+  dofile "3rdParty/zydec/zydec/project.lua"

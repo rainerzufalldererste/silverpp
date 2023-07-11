@@ -368,6 +368,7 @@ struct SFuncEval
 
 struct SFuncLineOptions
 {
+  bool decompileExpensiveLines = true;
   bool disasmExpensiveLines = true;
   float expensiveLineThreshold = 0.5;
   float relevantLineThreshold = 0.1;
