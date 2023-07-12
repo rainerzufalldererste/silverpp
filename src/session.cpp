@@ -387,11 +387,14 @@ bool LoadValue(_Inout_ BinaryReader &reader, SProcessInfo *pProcessInfo)
 
         pProcessInfo->modules[0].moduleBaseAddress = m.moduleBaseAddress;
         pProcessInfo->modules[0].moduleEndAddress = m.moduleEndAddress;
-        pProcessInfo->modules[0].startAddress = m.startAddress;
-        pProcessInfo->modules[0].endAddress = m.endAddress;
+        pProcessInfo->minimalIndirectVirtualAddress = pProcessInfo->minimalVirtualAddress = pProcessInfo->modules[0].startAddress = m.startAddress;
+        pProcessInfo->maximalIndirectVirtualAddress = pProcessInfo->maximalVirtualAddress = pProcessInfo->modules[0].endAddress = m.endAddress;
       }
       else
       {
+        pProcessInfo->minimalIndirectVirtualAddress = pProcessInfo->minimalVirtualAddress = min(pProcessInfo->minimalVirtualAddress, m.startAddress);
+        pProcessInfo->maximalIndirectVirtualAddress = pProcessInfo->maximalVirtualAddress = max(pProcessInfo->minimalVirtualAddress, m.endAddress);
+
         pProcessInfo->modules.push_back(std::move(m));
       }
     }

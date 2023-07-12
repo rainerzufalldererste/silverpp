@@ -23,6 +23,10 @@ jobs:
     - name: Add MSBuild to PATH
       uses: microsoft/setup-msbuild@v1.0.2
 
+    - name: Update Submodules
+      working-directory: ${{env.GITHUB_WORKSPACE}}
+      run: git submodule update --init --recursive
+
     - name: Create Solution Files
       working-directory: ${{env.GITHUB_WORKSPACE}}
       run: premake/premake5.exe vs2022

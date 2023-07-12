@@ -82,7 +82,7 @@ bool InstrumentFunctionWithSource(SAppInfo &appInfo, const size_t processIndex, 
     if (showDisasm)
       InstrumentFunctionDisassembly(appInfo, processIndex, function, options);
   }
-  else
+  else // load file, print relevant lines.
   {
     size_t maximumLineHits = 0;
 
@@ -257,7 +257,9 @@ bool EvaluateFunction(_In_ CComPtr<IDiaSession> &session, _In_ const SPerfEval &
   {
     CComPtr<IDiaEnumLineNumbers> lineNumEnum;
 
-    if (FAILED(session->findLinesByAddr(function.sector, function.offset + function.hitsOffset[i], 1, &lineNumEnum)))
+    const size_t hit = function.hitsOffset[i];
+
+    if (FAILED(session->findLinesByAddr(function.sector, function.offset + hit, 1, &lineNumEnum)))
       continue;
 
     CComPtr<IDiaLineNumber> lineNumber;
@@ -310,15 +312,13 @@ bool EvaluateFunction(_In_ CComPtr<IDiaSession> &session, _In_ const SPerfEval &
 
     size_t address;
 
-    if (FAILED(lineNumber->get_virtualAddress(&address)))
-      address = function.hitsOffset[i];
-    else if (address > function.hitsOffset[i] + function.symbolStartPos)
-      address = function.hitsOffset[i];
+    if (FAILED(lineNumber->get_virtualAddress(&address)) || address > hit + function.symbolStartPos) // if we can't get a length or the retrieved end would be out of bounds.
+      address = hit;
 
     DWORD length;
 
     if (FAILED(lineNumber->get_length(&length)))
-      length = (DWORD)(function.hitsOffset[i] + function.symbolStartPos - address);
+      length = (DWORD)(hit + function.symbolStartPos - address);
 
     const size_t endAddress = address + length;
 

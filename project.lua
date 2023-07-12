@@ -6,6 +6,8 @@ project(ProjectName)
   language "C++"
   staticruntime "On"
 
+  dependson { "zydec" }
+
   filter { "system:windows" }
     buildoptions { '/Gm-' }
     buildoptions { '/MP' }
@@ -29,9 +31,11 @@ project(ProjectName)
   
   includedirs { "$(VCInstallDir)../DIA SDK/include" }
   includedirs { "3rdParty/Zydis/include" }
+  includedirs { "3rdParty/zydec/zydec/include" }
 
   links { "$(VCInstallDir)../DIA SDK/lib/amd64/diaguids.lib" }
   links { "3rdParty/zydis/lib/Zydis.lib" }
+  links { "3rdParty/zydec/builds/lib/zydec.lib" }
 
   filter { "configurations:Debug", "system:Windows" }
     ignoredefaultlibraries { "libcmt" }
