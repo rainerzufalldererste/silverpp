@@ -58,10 +58,10 @@ wchar_t _CMD_PARAM_NO_DISASM[] = TEXT(CMD_PARAM_NO_DISASM);
 #define CMD_PARAM_VERBOSE "--verbose"
 wchar_t _CMD_PARAM_VERBOSE[] = TEXT(CMD_PARAM_VERBOSE);
 
-#define CMD_PARAM_STORE_SESSION "--store-session"
+#define CMD_PARAM_STORE_SESSION "--store"
 wchar_t _CMD_PARAM_STORE_SESSION[] = TEXT(CMD_PARAM_STORE_SESSION);
 
-#define CMD_PARAM_LOAD_SESSION "--load-session"
+#define CMD_PARAM_LOAD_SESSION "--load"
 wchar_t _CMD_PARAM_LOAD_SESSION[] = TEXT(CMD_PARAM_LOAD_SESSION);
 
 ////////////////////////////////////////////////////////////////////////////////

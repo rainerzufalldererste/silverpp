@@ -372,8 +372,8 @@ struct SFuncLineOptions
   bool disasmExpensiveLines = true;
   float expensiveLineThreshold = 0.5;
   float relevantLineThreshold = 0.1;
-  float disasmLineThreshold = 0.3;
-  float expensiveAsmThreshold = 0.1;
+  float disasmLineThreshold = 0.2;
+  float expensiveAsmThreshold = 0.075;
   size_t minAsmSamples = 8;
 };
 

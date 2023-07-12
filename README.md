@@ -29,21 +29,27 @@ After you've performed the operations you want to profile, simply close the appl
 
 Now select the region you want to analyze.
 
-<img src="https://raw.githubusercontent.com/rainerzufalldererste/silverpp/master/assets/ss1.png" alt="silverpp - Hot Functions" style="width: 919px; max-width: 100%">
+<img src="https://raw.githubusercontent.com/rainerzufalldererste/silverpp/master/assets/ss1.png" alt="silverpp - Hot Functions" style="width: 543px; max-width: 100%">
 
 Now select the function you want to profile.
 
-<img src="https://raw.githubusercontent.com/rainerzufalldererste/silverpp/master/assets/ss2.png" alt="silverpp - Source & Disassembly" style="width: 1175px; max-width: 100%">
+<img src="https://raw.githubusercontent.com/rainerzufalldererste/silverpp/master/assets/ss2.png" alt="silverpp - Source & Disassembly" style="width: 1461px; max-width: 100%">
 
 Browse through the source code with highlighted expensive lines & optional inline disassembly.
 
 It's that simple.
 
+### Storing / Loading Sessions.
+Profiling sessions can be stored by simply adding `--store <session_filename>` to the command-line parameters. To load a stored session simply run
+
+```batch
+silverpp.exe <PATH_TO_YOUR_APPLICATION> --load <session_filename>
+```
 
 ### How fast is fast?
 The performance impact is very minor, since silverpp only suspends the thread it's currently examining. You'll still get lots of profiling samples because silverpp is immediately yielding the CPU as soon as it's done.
 
-Here's a benchmark on <a href="https://github.com/rainerzufalldererste/rle8">rle8 - the fastest decoding run length compression for x64</a>.
+Here's a benchmark on [hypersonic-rle-kit - the fastest decoding run length compression for x64](https://github.com/rainerzufalldererste/hypersonic-rle-kit)</a>.
 
 <img src="https://raw.githubusercontent.com/rainerzufalldererste/silverpp/master/assets/bargraph.png" alt="silverpp - Source & Disassembly" style="width: 366px; max-width: 80%">
 
